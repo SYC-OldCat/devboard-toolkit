@@ -157,7 +157,11 @@ def _ensure_folder(unc_folder: str) -> None:
 
 def _project_tool_dir() -> str:
     """定位项目根目录下的 tool/ 文件夹"""
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if getattr(sys, 'frozen', False):
+        project_root = os.path.dirname(sys.executable)
+    else:
+        project_root = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+        else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(project_root, "tool")
 
 
@@ -281,29 +285,24 @@ def validate_replay_env(replay_dir: str, need_build: bool,
             print(f"  [!] lib/ 补全失败: {e}")
             return (False, None)
 
-    # ---------- 2. fcf 标定 ----------
+    # ---------- 2. fcf 标定 (方案 B: 直接覆盖, 不校验是否存在) ----------
     veh_dst = os.path.join(replay_dir, "vehConfig.json")
     vru_dst = os.path.join(replay_dir, "vruConfig.json")
-    fcf_exists = os.path.isfile(veh_dst) and os.path.isfile(vru_dst)
-    if fcf_exists:
-        print(f"  [✓] fcf 标定完整(vehConfig.json + vruConfig.json),跳过")
+    fcf_dir = fcf_src_dir  # 参数名和外层变量冲突,改用局部
+    if fcf_dir and os.path.isdir(fcf_dir):
+        print(f"  [i] fcf 标定: 使用外部指定的版本 → {os.path.basename(fcf_dir)}")
     else:
-        print(f"  [!] fcf 标定缺失 (vehConfig.json / vruConfig.json)")
-        fcf_dir = fcf_src_dir  # 参数名和外层变量冲突,改用局部
-        if fcf_dir and os.path.isdir(fcf_dir):
-            print(f"  [i] 使用外部指定的 fcf 版本: {fcf_dir}")
-        else:
-            fcf_dir = _select_fcf_version(tool_dir)
-            if not fcf_dir:
-                return (False, None)
-        import shutil as _sh
-        try:
-            _sh.copy2(os.path.join(fcf_dir, "vehConfig.json"), veh_dst)
-            _sh.copy2(os.path.join(fcf_dir, "vruConfig.json"), vru_dst)
-            print(f"  [✓] fcf 标定已补全")
-        except Exception as e:
-            print(f"  [!] fcf 标定补全失败: {e}")
+        fcf_dir = _select_fcf_version(tool_dir)
+        if not fcf_dir:
             return (False, None)
+    import shutil as _sh
+    try:
+        _sh.copy2(os.path.join(fcf_dir, "vehConfig.json"), veh_dst)
+        _sh.copy2(os.path.join(fcf_dir, "vruConfig.json"), vru_dst)
+        print(f"  [✓] fcf 标定已覆盖 (vehConfig.json + vruConfig.json)")
+    except Exception as e:
+        print(f"  [!] fcf 标定覆盖失败: {e}")
+        return (False, None)
 
     # ---------- 3. (仅跳过编译时) runtime + 感知包 ----------
     app_name = ""
@@ -374,8 +373,81 @@ def _detect_idle_boards(boards: dict, workers: int = 6) -> List[str]:
     return idle
 
 
-def _split_txt(txt_path: str, n: int, out_dir: str) -> List[str]:
-    """读取 txt,均分为 n 份,输出到 out_dir(UNC 路径)下
+# 路径映射 (与 classify_by_car.py 保持一致, 反向: 板端 Linux 路径 → Windows UNC)
+# 用于 _split_txt sort_by_size=True 时从板端路径反查得到 UNC 路径后调用 os.path.getsize
+_UNC_TO_LINUX_MAP = {
+    r"\\hz-iotfs02\Model_Test\TestSpace\Personal_Space": "/tmp/iot_test/mnt_data",
+    r"\\Material\xuekangkang\download": "/tmp/iot_test/mnt_data",
+    r"\\hz-iotfs02\Function_Test\Front_Camera": "/tmp/iot_test/mnt_data",
+    r"\\Material\chz62985\download": "/tmp/iot_test/mnt_data",
+}
+_LINUX_TO_UNC_MAP = {v: k for k, v in _UNC_TO_LINUX_MAP.items()}
+
+
+def _strip_quotes(p: str) -> str:
+    """去掉路径两端可能的单/双引号 (txt 行内容有时被引号包裹)."""
+    return p.strip().strip("'").strip('"')
+
+
+def _to_unc_candidates(line_path: str) -> List[str]:
+    """把素材行转换为「可能的 UNC 候选列表」(按优先级), 供 getsize 逐一尝试.
+
+    规则:
+      1. 先去两端引号
+      2. 已是 UNC 格式 → 直接作为单候选
+      3. 板端 /tmp/iot_test/mnt_data/...  (多个 UNC 共享同板端前缀)
+         → 生成所有 UNC 前缀拼接相对路径的候选
+      4. 普通板端 Linux 路径 (一对一映射) → 按 _LINUX_TO_UNC_MAP
+    """
+    raw = _strip_quotes(line_path)
+    s = raw.replace("\\", "/")
+
+    # a) 已是 UNC 格式 (反斜杠开头)
+    for unc_pfx in _UNC_TO_LINUX_MAP.keys():
+        if raw.startswith(unc_pfx):
+            return [raw]
+    # b) 已是 UNC 格式 (正斜杠归一化后匹配)
+    for unc_pfx in _UNC_TO_LINUX_MAP.keys():
+        up = unc_pfx.replace("\\", "/")
+        if s.startswith(up):
+            return [unc_pfx + s[len(up):]]
+
+    # c) 板端 /tmp/iot_test/mnt_data/...  → 多 UNC 候选(所有共享都挂载到此)
+    shared_pfx = "/tmp/iot_test/mnt_data/"
+    if s.startswith(shared_pfx):
+        relative = s[len(shared_pfx):]
+        rel_fs = relative.replace("/", os.sep)
+        cands = []
+        for unc in _UNC_TO_LINUX_MAP.keys():
+            cands.append(os.path.join(unc, rel_fs))
+        return cands
+
+    # d) 其他板端 Linux 前缀 (一对一映射)
+    for linux_pfx, unc_pfx in _LINUX_TO_UNC_MAP.items():
+        lp = linux_pfx.replace("\\", "/")
+        if s.startswith(lp):
+            tail = s[len(lp):].replace("/", os.sep)
+            return [os.path.join(unc_pfx, tail)]
+
+    # e) 不匹配任何映射, 当成本地路径原样返回
+    return [raw]
+
+
+def _to_unc_path(line_path: str) -> str:
+    """保留旧 API: 返回首个候选 (调用方自行处理失败)."""
+    cands = _to_unc_candidates(line_path)
+    return cands[0] if cands else line_path
+
+
+def _split_txt(txt_path: str, n: int, out_dir: str, sort_by_size: bool = False) -> List[str]:
+    """读取 txt, 切分为 n 份, 输出到 out_dir(UNC 路径)下
+
+    Args:
+        txt_path: 源 txt 路径
+        n: 目标分片数
+        out_dir: 输出目录 (UNC)
+        sort_by_size: True → 按 .h265/.h264 文件大小降序 LPT 轮询分配 (均衡回灌时长)
+                      False → 原始顺序均分 (旧行为)
 
     Returns:
         生成的子 txt 文件名列表(仅文件名)
@@ -395,22 +467,82 @@ def _split_txt(txt_path: str, n: int, out_dir: str) -> List[str]:
         raise ValueError("txt 文件内容为空")
 
     base = p.stem
-    size = total // n
-    remainder = total % n
-
     out_dir_path = Path(out_dir)
     out_dir_path.mkdir(parents=True, exist_ok=True)
 
+    # ---- sort_by_size: 按文件大小降序 LPT 轮询分配到 n 个分片 ----
+    if sort_by_size:
+        import os as _os
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _get_size(line: str) -> int:
+            for cand in _to_unc_candidates(line):
+                try:
+                    return _os.path.getsize(cand)
+                except Exception:
+                    continue
+            return 0
+
+        # 并行获取所有素材文件大小 (UNC 路径, 网络 IO, 并行快; 每条多候选逐一尝试)
+        sizes = [0] * total
+        workers = min(32, max(1, total))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_get_size, lines[i]): i for i in range(total)}
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                try:
+                    sizes[idx] = fut.result()
+                except Exception:
+                    sizes[idx] = 0
+
+        total_size = sum(sizes)
+        # 全 0 兜底: 所有 UNC 都访问不到 → 退化为原始顺序均分, 避免 LPT 堆全 0 都塞到第 1 片
+        if total_size == 0:
+            size = total // n
+            remainder = total % n
+            chunks = []
+            start = 0
+            for i in range(n):
+                cnt = size + (1 if i < remainder else 0)
+                chunks.append(lines[start:start + cnt])
+                start += cnt
+        else:
+            # 按大小降序, 大小相同按原索引保序
+            order = sorted(range(total), key=lambda i: (-sizes[i], i))
+
+            # LPT 轮询: 按大小降序依次分配给"当前总大小最小"的分片 (最小堆)
+            import heapq
+            parts_sums = [0] * n   # 每个分片当前总字节
+            parts_lines = [[] for _ in range(n)]
+            heap = [(0, i) for i in range(n)]  # (sum, part_idx)
+            heapq.heapify(heap)
+
+            for idx in order:
+                cur_size = sizes[idx]
+                s, p_idx = heapq.heappop(heap)
+                parts_lines[p_idx].append(lines[idx])
+                parts_sums[p_idx] = s + cur_size
+                heapq.heappush(heap, (parts_sums[p_idx], p_idx))
+
+            chunks = parts_lines
+    else:
+        # ---- 旧行为: 原始顺序均分 ----
+        size = total // n
+        remainder = total % n
+        chunks = []
+        start = 0
+        for i in range(n):
+            cnt = size + (1 if i < remainder else 0)
+            chunks.append(lines[start:start + cnt])
+            start += cnt
+
     out_names = []
-    start = 0
     for i in range(n):
-        cnt = size + (1 if i < remainder else 0)
-        chunk = lines[start:start + cnt]
-        start += cnt
         sub_name = f"{base}_{i + 1}.txt"
         sub_path = out_dir_path / sub_name
         with open(sub_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(chunk) + "\n")
+            if chunks[i]:
+                f.write("\n".join(chunks[i]) + "\n")
         out_names.append(sub_name)
     return out_names
 
@@ -476,8 +608,14 @@ def _launch_terminals(project_root: str,
         delete_script: 回灌结束后自动删除脚本
         no_reboot_boards: 集合,板名在其中的会传 --no-reboot (接力跳过reboot)
     """
-    runner_path = os.path.join(project_root, "per_board_runner.py")
-    python_exe = sys.executable
+    # --- exe 打包适配: frozen 环境下用 per_board_runner.exe, 否则用 .py ---
+    if getattr(sys, 'frozen', False):
+        # PyInstaller exe 环境: runner 已编译为独立 exe
+        runner_path = os.path.join(os.path.dirname(sys.executable), "per_board_runner.exe")
+        python_exe = ""  # exe 直接运行, 不需要 python 前缀
+    else:
+        runner_path = os.path.join(project_root, "per_board_runner.py")
+        python_exe = sys.executable
     boards = load_boards()
     no_reboot_boards = no_reboot_boards or set()
 
@@ -516,8 +654,10 @@ def _launch_terminals(project_root: str,
             print(f"  {i+1}. {board:<8s} {host:<16s} → {script_name}{skip_tag}")
             if i > 0:
                 wt_cmd.append(";")
-            wt_cmd.extend(["new-tab", "--title", tab_title,
-                           python_exe, runner_path, board, folder, script_name])
+            wt_cmd.extend(["new-tab", "--title", tab_title])
+            if python_exe:
+                wt_cmd.append(python_exe)
+            wt_cmd.extend([runner_path, board, folder, script_name])
             wt_cmd.extend(extra_args)
             wt_cmd.extend(_board_args(board))
         subprocess.Popen(wt_cmd, cwd=project_root)
@@ -526,9 +666,13 @@ def _launch_terminals(project_root: str,
             host = boards.get(board, {}).get("host", board)
             skip_tag = " [skip-reboot]" if board in no_reboot_boards else ""
             print(f"  {i}. {board:<8s} {host:<16s} → {script_name}{skip_tag}")
+            cmd = []
+            if python_exe:
+                cmd.append(python_exe)
+            cmd += [runner_path, board, folder, script_name]
+            cmd += extra_args + _board_args(board)
             subprocess.Popen(
-                [python_exe, runner_path, board, folder, script_name]
-                + extra_args + _board_args(board),
+                cmd,
                 cwd=project_root,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
@@ -613,9 +757,9 @@ def batch_replay_main(pre_filled_app: str = None) -> int:
     car_model, calibration = _select_car_model(car_models)
     print(f"  → 已选: 车型={car_model} / 标定={calibration}")
 
-    # === [4/6] 均分 txt(写到回灌目录) ===
-    print(f"\n[4/6] 均分 txt 为 {n} 份,保存到回灌目录...")
-    sub_files = _split_txt(txt_path, n, out_dir=unc_replay_folder)
+    # === [4/6] 均分 txt(写到回灌目录, 按文件大小 LPT 均衡) ===
+    print(f"\n[4/6] 均分 txt 为 {n} 份 + 按文件大小 LPT 均衡, 保存到回灌目录...")
+    sub_files = _split_txt(txt_path, n, out_dir=unc_replay_folder, sort_by_size=True)
     print(f"[+] 已生成 {len(sub_files)} 个子 txt:")
     for i, sf in enumerate(sub_files, 1):
         full = os.path.join(unc_replay_folder, sf)
@@ -646,7 +790,8 @@ def batch_replay_main(pre_filled_app: str = None) -> int:
     for i, board in enumerate(idle_boards):
         script_name = Path(scripts[i]).name
         assignments.append((board, replay_folder, script_name))
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+        else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     log_dir = os.path.join(unc_replay_folder, "logs")
     _launch_terminals(project_root, assignments, log_dir=log_dir, app_suffix=suffix)
 
@@ -844,7 +989,8 @@ def full_auto_main() -> int:
     # === [5/7] 自动编译(若需要) ===
     if need_build:
         print(f"\n[5/7] 启动 Jenkins 自动编译 (产物和 runtime 将放到回灌目录)...")
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        project_root = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+        else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
         try:
@@ -877,11 +1023,11 @@ def full_auto_main() -> int:
     }
 
     if replay_mode == "list":
-        print(f"\n[6/7] 均分 txt 为 {n} 份 + 生成 {n} 个启动脚本...")
+        print(f"\n[6/7] 均分 txt 为 {n} 份(按文件大小 LPT 均衡) + 生成 {n} 个启动脚本...")
         print(f"      感知包名: {app_path}")
         print(f"      后缀    : {suffix}")
 
-        sub_files = _split_txt(txt_path, n, out_dir=unc_replay_folder)
+        sub_files = _split_txt(txt_path, n, out_dir=unc_replay_folder, sort_by_size=True)
         print(f"[+] 已生成 {len(sub_files)} 个子 txt:")
         for i, sf in enumerate(sub_files, 1):
             full = os.path.join(unc_replay_folder, sf)
@@ -914,7 +1060,8 @@ def full_auto_main() -> int:
     for i, board in enumerate(idle_boards):
         script_name = Path(scripts[i]).name
         assignments.append((board, replay_folder, script_name))
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+        else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     log_dir = os.path.join(unc_replay_folder, "logs")
     _launch_terminals(project_root, assignments, log_dir=log_dir, app_suffix=suffix)
 

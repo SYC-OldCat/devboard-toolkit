@@ -9,7 +9,6 @@
          └─ TabPipeline          (组合流水线)
 """
 
-import contextlib
 import datetime as _dt
 import os
 import sys
@@ -25,7 +24,8 @@ from typing import Callable, Optional
 # 确保 sys.path 包含项目根目录 (解决 python devboard_toolkit\gui.py 启动时
 # sys.path[0] = devboard_toolkit\ 导致 from devboard_toolkit.xxx 找不到包)
 # ---------------------------------------------------------------------------
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+    else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 # 同时把项目根目录加到 PYTHONPATH 环境变量, 这样子进程/新线程也能找到
@@ -37,7 +37,7 @@ os.environ["PYTHONPATH"] = _PROJECT_ROOT + os.pathsep + os.environ.get("PYTHONPA
 # ---------------------------------------------------------------------------
 
 class _GUILogWriter:
-    """重定向 sys.stdout 到 GUI 日志面板 (线程安全)
+    """重定向 stdout 到 GUI 日志面板 (线程安全)
 
     通过 queue 把日志传到主线程, 由 _LogPanel.poll_log() 消费。
     支持可选 prefix, 用于多任务并发时区分 [T1]/[T2] 等输出。
@@ -51,11 +51,6 @@ class _GUILogWriter:
     def write(self, text):
         if not text:
             return
-        # 同时写原始 stdout (方便调试)
-        try:
-            self._orig.write(text)
-        except Exception:
-            pass
         self._buffer += text
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
@@ -70,17 +65,58 @@ class _GUILogWriter:
                     self._q.put(p.rstrip())
 
     def flush(self):
-        try:
-            self._orig.flush()
-        except Exception:
-            pass
+        pass
+
+
+class _ThreadLocalStdout:
+    """线程局部的 stdout 代理
+
+    每个线程可通过 set_writer() 设置自己的重定向 writer,
+    未设置的线程走原始 stdout, 实现各 tab 日志独立不串台。
+    """
+    _instance = None
+
+    def __init__(self, original):
+        self._original = original
+        self._local = threading.local()
+
+    def set_writer(self, writer):
+        self._local.writer = writer
+
+    def clear_writer(self):
+        if hasattr(self._local, 'writer'):
+            del self._local.writer
+
+    def write(self, text):
+        if not text:
+            return
+        writer = getattr(self._local, 'writer', None)
+        if writer is not None:
+            writer.write(text)
+        else:
+            self._original.write(text)
+
+    def flush(self):
+        writer = getattr(self._local, 'writer', None)
+        if writer is not None:
+            writer.flush()
+        else:
+            self._original.flush()
+
+    @classmethod
+    def install(cls):
+        """全局安装线程局部 stdout 代理 (仅安装一次)"""
+        if cls._instance is None:
+            cls._instance = _ThreadLocalStdout(sys.stdout)
+            sys.stdout = cls._instance
+        return cls._instance
 
 
 def _run_in_thread(target, log_panel, stop_event, on_done=None, prefix=""):
     """在后台线程中执行 target, stdout 重定向到 log_panel
 
-    每个 tab 独立的 writer, 使用 contextlib.redirect_stdout 做局部上下文
-    重定向, 避免 4 个 tab 同时运行时 sys.stdout 全局替换导致日志串台。
+    使用线程局部的 _ThreadLocalStdout, 每个线程的 print() 只输出到
+    对应的 log_panel, 避免多个 tab 同时运行时日志串台。
 
     Args:
         target: 可调用对象, 接受 stop_event 参数
@@ -89,16 +125,16 @@ def _run_in_thread(target, log_panel, stop_event, on_done=None, prefix=""):
         on_done: 完成后的回调, 接受 (rc, app_name) 参数
         prefix: 日志前缀 (如 "[T1] "), 用于多任务并发时区分输出
     """
+    tls_stdout = _ThreadLocalStdout.install()
     log_queue = queue.Queue()
-    original_stdout = sys.stdout
-    writer = _GUILogWriter(log_queue, original_stdout, prefix=prefix)
+    writer = _GUILogWriter(log_queue, tls_stdout._original, prefix=prefix)
 
     def _worker():
         rc = None
         app_name = None
+        tls_stdout.set_writer(writer)
         try:
-            with contextlib.redirect_stdout(writer):
-                result = target(stop_event)
+            result = target(stop_event)
             if isinstance(result, tuple):
                 app_name, rc = result
             else:
@@ -108,6 +144,7 @@ def _run_in_thread(target, log_panel, stop_event, on_done=None, prefix=""):
             rc = 1
         finally:
             writer.flush()
+            tls_stdout.clear_writer()
             log_queue.put(None)  # 结束标记
             if on_done:
                 log_panel.after(0, lambda: on_done(rc, app_name))
@@ -288,13 +325,6 @@ class _LogPanel(ttk.LabelFrame):
                 self.status_var.set(f"{value}/{total}  ({pct:.0f}%)")
 
 
-def _placeholder(btn_name: str, log: Optional[_LogPanel] = None):
-    """按钮点击占位: 弹提示 + 写日志"""
-    msg = f"[占位] 点击了 [{btn_name}],功能尚未连接实际逻辑"
-    if log:
-        log.log(msg, "warn")
-    messagebox.showinfo("功能占位", f"{btn_name}\n\n(界面 demo,暂未连接实际功能)")
-
 
 # ---------------------------------------------------------------------------
 # Tab 1: 数据处理
@@ -437,7 +467,10 @@ class TabDataProcessing(ttk.Frame):
     def _on_toggle_jira(self):
         if self.v_jira.get():
             for child in self._jira_content.winfo_children():
-                child.configure(state="normal")
+                try:
+                    child.configure(state="normal")
+                except Exception:
+                    pass
         else:
             for child in self._jira_content.winfo_children():
                 try:
@@ -448,7 +481,10 @@ class TabDataProcessing(ttk.Frame):
     def _on_toggle_adas(self):
         if self.v_adas.get():
             for child in self._adas_content.winfo_children():
-                child.configure(state="normal")
+                try:
+                    child.configure(state="normal")
+                except Exception:
+                    pass
         else:
             for child in self._adas_content.winfo_children():
                 try:
@@ -631,7 +667,7 @@ class TabJenkinsBuild(ttk.Frame):
         self.log_panel.text.configure(state="disabled")
 
         def _task(stop_event):
-            project_root = os.path.dirname(os.path.dirname(__file__))
+            project_root = _PROJECT_ROOT
             if project_root not in sys.path:
                 sys.path.insert(0, project_root)
             from jenkins_build import auto_build_main
@@ -782,6 +818,25 @@ class TabFeedback(ttk.Frame):
         ttk.Label(row_sdk_path, text="例: 20260810/0452",
                   style="Hint.TLabel").pack(side="left", padx=(8, 0))
 
+        # 视频路径 (智能检测: 已预处理 → 列表回灌, 未预处理 → 复制+预处理+SDK回灌)
+        row_sdk_video = ttk.Frame(sdk_tab)
+        row_sdk_video.pack(fill="x", pady=4)
+        ttk.Label(row_sdk_video, text="视频路径:", width=14, anchor="w").pack(side="left")
+        self.sdk_video_var = tk.StringVar()
+        ttk.Entry(row_sdk_video, textvariable=self.sdk_video_var, width=30).pack(
+            side="left", fill="x", expand=True)
+        def _browse_sdk_video():
+            init_dir = self._unc_testbed or os.getcwd()
+            p = filedialog.askdirectory(
+                title="选择视频路径 (含 .h265/.h264 的目录)",
+                initialdir=init_dir)
+            if p:
+                self.sdk_video_var.set(p)
+        ttk.Button(row_sdk_video, text="浏览…", width=8,
+                   command=_browse_sdk_video).pack(side="left", padx=(4, 0))
+        ttk.Label(row_sdk_video, text="(可选, 填后自动检测预处理状态)",
+                  style="Hint.TLabel").pack(side="left", padx=(8, 0))
+
         list_tab = ttk.Frame(nb)
         nb.add(list_tab, text=" 列表回灌 ")
 
@@ -828,6 +883,11 @@ class TabFeedback(ttk.Frame):
                    command=self._on_start).pack(side="left")
         ttk.Button(btns, text="\u00d7 停止", style="Danger.TButton",
                    command=self._on_stop).pack(side="left", padx=8)
+        ttk.Label(btns, text="停止任务:").pack(side="left", padx=(4, 0))
+        self._stop_task_var = tk.StringVar()
+        self._stop_task_combo = ttk.Combobox(btns, textvariable=self._stop_task_var,
+                                             state="readonly", width=12)
+        self._stop_task_combo.pack(side="left", padx=2)
         ttk.Button(btns, text="\U0001f4c2 打开回灌目录", style="Ghost.TButton",
                    command=self._on_open_dir).pack(side="left")
         self.v_delete_scripts = tk.BooleanVar(value=False)
@@ -954,6 +1014,12 @@ class TabFeedback(ttk.Frame):
             for bn in boards:
                 if bn not in self._available_pool and bn not in self._busy_boards:
                     self._available_pool.append(bn)
+
+    def _pool_remove(self, board_name):
+        """从空闲池移除指定板 (加锁). 用于检测到空闲池中的板已变忙."""
+        with self._pool_lock:
+            if board_name in self._available_pool:
+                self._available_pool.remove(board_name)
 
     def _pool_size(self):
         """获取当前空闲板池大小 (加锁)."""
@@ -1167,17 +1233,23 @@ class TabFeedback(ttk.Frame):
                 messagebox.showwarning("提示", "请输入日期")
                 return
         else:
+            # SDK 模式
             user = self.sdk_user_var.get().strip()
             date = self.sdk_date_var.get().strip()
             input_subpath = self.sdk_path_var.get().strip().replace("\\", "/").strip("/")
+            sdk_video_path = self.sdk_video_var.get().strip()
             if not user:
                 messagebox.showwarning("提示", "请输入用户名")
                 return
             if not date:
                 messagebox.showwarning("提示", "请输入日期")
                 return
-            if not input_subpath:
-                messagebox.showwarning("提示", "请输入素材相对路径")
+            # 视频路径有值时, 素材相对路径可选 (仅未预处理分支需要)
+            if not sdk_video_path and not input_subpath:
+                messagebox.showwarning("提示", "请输入素材相对路径或视频路径")
+                return
+            if sdk_video_path and not os.path.isdir(sdk_video_path):
+                messagebox.showwarning("提示", f"视频路径不存在: {sdk_video_path}")
                 return
 
         pkg_name = self.pkg_var.get().strip()
@@ -1205,6 +1277,7 @@ class TabFeedback(ttk.Frame):
             "user": user,
             "date": date,
             "input_subpath": input_subpath if mode == "sdk" else "",
+            "sdk_video_path": sdk_video_path if mode == "sdk" else "",
             "pkg_name": pkg_name,
             "car_model": car_model,
             "fcf_version": self.cal_var.get().strip(),
@@ -1243,6 +1316,7 @@ class TabFeedback(ttk.Frame):
             # 清理已完成任务
             if task_id in self._tasks:
                 del self._tasks[task_id]
+            self._refresh_stop_combo()
 
         thread = _run_in_thread(_task, self.log_panel, stop_event, _on_done, prefix=prefix)
         self._tasks[task_id] = {
@@ -1251,6 +1325,7 @@ class TabFeedback(ttk.Frame):
             "status": "running",
             "ctx": task_ctx,
         }
+        self._refresh_stop_combo()
 
     def _do_start_task(self, ctx, stop_event):
         from pathlib import Path
@@ -1354,7 +1429,7 @@ class TabFeedback(ttk.Frame):
                 sorted_txts = [list_input_path]
 
             # ==== Step B: 流水线式 txt 回灌 (自适应切分 + 动态调度 + 增量检测) ====
-            BOARD_RESCAN_INTERVAL = 120  # 增量检测间隔: 2 分钟
+            BOARD_RESCAN_INTERVAL = 60  # 增量检测间隔: 1 分钟
 
             print(f"\n{'=' * 60}")
             print(f"  [B] 回灌队列表 (共 {len(sorted_txts)} 个 txt, 流水线模式)")
@@ -1381,11 +1456,28 @@ class TabFeedback(ttk.Frame):
             os.makedirs(log_dir, exist_ok=True)
 
             queue = list(sorted_txts)      # 待回灌队列
-            running_txts = {}               # {txt_path: {"boards": [...], "round": N, "per_target": N}}
+            # running_txts 结构:
+            # {txt_path: {
+            #     "boards": [...],                  # 当前在跑的板
+            #     "round": N,
+            #     "per_target": N,
+            #     "pending": [(script_path, sub_file, line_cnt), ...],  # 剩余待接力的分片队列
+            #     "vars_map": {...},                # 复用的参数映射
+            #     "car_model": str,                 # 复用的车型
+            #     "suffix": str,                    # 复用的后缀
+            #     "delete_script": bool,
+            #     "log_dir": str,
+            #     "replay_folder": str,
+            # }}
+            running_txts = {}
             round_counter = 0
 
             def _start_one_txt(txt_path, boards_to_use):
-                """启动单个 txt 的回灌 (自适应切分+生成脚本+启动终端), 返回 (ok, per_target)"""
+                """启动单个 txt 的回灌 (自适应切分+生成脚本+启动终端)
+                返回: (ok, per_target, pending_list, extra_ctx_dict)
+                  pending_list: 剩余未启动的分片 [(script_path, sub_file, line_cnt), ...]
+                  extra_ctx_dict: 用于后续接力跑的上下文 (vars_map, car_model, suffix, ...)
+                """
                 nonlocal round_counter
                 round_counter += 1
                 round_idx = round_counter
@@ -1395,24 +1487,35 @@ class TabFeedback(ttk.Frame):
                 except Exception:
                     total_n = 0
 
-                # === 自适应切分: 每份目标条数 clamp(ceil(total/(板数*3)), 8, 60) ===
-                board_count = len(boards_to_use) if boards_to_use else 1
+                # === 自适应切分: 按"配置文件板总数"计算分片数 (给后续新上线板预留分片) ===
+                try:
+                    from devboard_toolkit.config import load_boards
+                    all_boards_cfg = load_boards()
+                    use_online_local = bool(self.use_online_var.get())
+                    max_board_count = sum(
+                        1 for n in all_boards_cfg.keys()
+                        if use_online_local or not n.lower().startswith("online")
+                    )
+                except Exception:
+                    max_board_count = 6  # 兜底
+                max_board_count = max(1, max_board_count)
+
                 if total_n == 0:
                     per_target = 8
                     n_parts = 1
                 else:
-                    # 向上取整 ceil(total / (board_count * 3))
-                    divisor = board_count * 3
+                    # 向上取整 ceil(total / (max_board_count * 3)), 预留足够分片给后续上线板
+                    divisor = max_board_count * 3
                     per_target = (total_n + divisor - 1) // divisor
-                    per_target = max(8, min(60, per_target))  # clamp [8, 60]
-                    n_parts = (total_n + per_target - 1) // per_target  # 总份数
-                    n_parts = max(1, min(n_parts, len(boards_to_use)))  # 不超过板数上限
-                    # 按实际份数重新反推 per_target (避免最后一份太小)
-                    per_target = (total_n + n_parts - 1) // n_parts
+                    per_target = max(2, min(60, per_target))  # clamp [2, 60]
+                    n_parts = (total_n + per_target - 1) // per_target
+                    n_parts = max(1, n_parts)
+
+                _cur_boards = len(boards_to_use) if boards_to_use else 1
 
                 print(f"\n{'=' * 60}")
                 print(f"  [B-{round_idx}] 启动回灌: {os.path.basename(txt_path)}  "
-                      f"({total_n} 条, 用 {len(boards_to_use)} 块板, "
+                      f"({total_n} 条, 当前 {len(boards_to_use)} 块板, 全配置 {max_board_count} 块板, "
                       f"切 {n_parts} 份, 每份约 {per_target} 条)")
                 print(f"{'=' * 60}")
 
@@ -1423,7 +1526,7 @@ class TabFeedback(ttk.Frame):
                         os.path.basename(txt_path), car_models)
                     if not matched_car:
                         print(f"[!] 无法匹配车型标定,跳过: {os.path.basename(txt_path)}")
-                        return False, per_target
+                        return False, per_target, [], {}, []
                     vars_map_this = dict(vars_map)
                     vars_map_this["CAR_MODEL"] = matched_car
                     vars_map_this["CALIBRATION"] = matched_calib
@@ -1443,15 +1546,37 @@ class TabFeedback(ttk.Frame):
                         except Exception:
                             pass
 
-                # 自适应切分 txt + 生成脚本
+                # 自适应切分 txt + 生成脚本 (按文件大小 LPT 轮询, 均衡回灌时长)
                 print(f"\n[*] 自适应切分 txt ({os.path.basename(txt_path)}) 为 {n_parts} 份 "
-                      f"(每份约 {per_target} 条)...")
-                sub_files = _split_txt(txt_path, n_parts, out_dir=unc_replay_folder)
+                      f"(每份约 {per_target} 条, 按文件大小 LPT 均衡)...")
+                sub_files = _split_txt(txt_path, n_parts, out_dir=unc_replay_folder,
+                                       sort_by_size=True)
+                sub_line_counts = []
                 print(f"[+] 已生成 {len(sub_files)} 个子 txt:")
                 for i, sf in enumerate(sub_files, 1):
                     full = os.path.join(unc_replay_folder, sf)
                     line_cnt = sum(1 for _ in open(full, encoding="utf-8") if _.strip())
+                    sub_line_counts.append(line_cnt)
                     print(f"    {i}. {sf}  ({line_cnt} 条)")
+
+                # 清理 replay_tmp 中本次所有分片的旧残留 (running_/failed_/tmp_*), 防跨任务污染
+                replay_tmp_dir = os.path.join(unc_replay_folder, "replay_tmp")
+                if os.path.isdir(replay_tmp_dir):
+                    import glob as _glob_local
+                    removed_cnt = 0
+                    for sf in sub_files:
+                        # sf = yaq_463_1.txt (无路径, stem 用作匹配后缀)
+                        stem = os.path.splitext(sf)[0]
+                        for pat in [f"running_{stem}.*", f"failed_{stem}.*",
+                                    f"tmp_run_*", f"tmp_next_*"]:
+                            for fp in _glob_local.glob(os.path.join(replay_tmp_dir, pat)):
+                                try:
+                                    os.remove(fp)
+                                    removed_cnt += 1
+                                except Exception:
+                                    pass
+                    if removed_cnt:
+                        print(f"  [i] 清理 replay_tmp 残留 {removed_cnt} 个文件")
 
                 scripts = []
                 print(f"\n[*] 生成 {n_parts} 个启动脚本...")
@@ -1466,26 +1591,41 @@ class TabFeedback(ttk.Frame):
                 if scripts:
                     self.after(0, lambda p=scripts[0]: self.script_path.set(p))
 
-                # 启动终端 (只用 n_parts 块板, 多余的板退回 available 池)
-                actual_boards = boards_to_use[:n_parts]
-                returned_boards = boards_to_use[n_parts:]
+                # 启动终端数 = min(板数, 分片数)
+                n_launch = min(len(boards_to_use), n_parts)
+                actual_boards = boards_to_use[:n_launch]
+                returned_boards = boards_to_use[n_launch:]
                 if returned_boards:
                     print(f"  [i] 切分数 < 分配板数, 退回 {len(returned_boards)} 块到空闲池: "
                           f"{', '.join(returned_boards)}")
                     self._pool_return_batch(returned_boards)
 
-                # 区分首次启动板 / 接力板: 接力板传 --no-reboot
+                # 构建分片信息列表: [(script_path, sub_file, line_cnt), ...]
+                all_parts = list(zip(scripts, sub_files, sub_line_counts))
+                launch_parts = all_parts[:n_launch]      # 首批启动的
+                pending_parts = all_parts[n_launch:]     # 剩余等待接力的
+
+                # 启动新 txt: 所有板都 reboot (防止上次挂载到其他路径导致回灌失败)
                 no_reboot_set = set()
                 for bn in actual_boards:
-                    if not self._board_first_run.get(bn, True):
-                        no_reboot_set.add(bn)
-                    else:
-                        self._board_first_run[bn] = False  # 标记已使用,下次接力跳过reboot
+                    self._board_first_run[bn] = False  # 标记已使用,同txt内接力跳过reboot
 
+                # 逐板分配明细: 板名 → 启动脚本 → 对应分片 + 条数
                 assignments = []
+                print(f"\n[*] 板 → 分片 分配明细 (首批 {len(actual_boards)} 块板"
+                      f", 待接力 {len(pending_parts)} 份):")
                 for i, board_name in enumerate(actual_boards):
-                    script_name = Path(scripts[i]).name if i < len(scripts) else Path(scripts[-1]).name
+                    script_path, sf, lc = launch_parts[i]
+                    script_name = Path(script_path).name
+                    reboot_tag = "[skip-reboot]" if board_name in no_reboot_set else "[reboot]"
+                    print(f"    {i+1:2d}. {board_name:<16s} → {script_name:<32s} "
+                          f"← {sf} ({lc:3d} 条)  {reboot_tag}")
                     assignments.append((board_name, ctx["replay_folder"], script_name))
+
+                if pending_parts:
+                    print(f"  [i] 以下 {len(pending_parts)} 份等待接力续跑:")
+                    for j, (sp, sf, lc) in enumerate(pending_parts, 1):
+                        print(f"    待-{j}. {Path(sp).name:<32s} ← {sf} ({lc:3d} 条)")
 
                 from devboard_toolkit.batch_replay import _launch_terminals
                 _launch_terminals(
@@ -1495,8 +1635,17 @@ class TabFeedback(ttk.Frame):
                     no_reboot_boards=no_reboot_set,
                 )
                 print(f"\n[+] 已启动回灌 (txt={os.path.basename(txt_path)}, "
-                      f"板: {', '.join(actual_boards)})")
-                return True, per_target
+                      f"首批板: {', '.join(actual_boards)}, 待接力: {len(pending_parts)} 份)")
+
+                extra_ctx = {
+                    "vars_map": vars_map_this,
+                    "car_model": car_model_this,
+                    "suffix": suffix,
+                    "delete_script": delete_script,
+                    "log_dir": log_dir,
+                    "replay_folder": ctx["replay_folder"],
+                }
+                return True, per_target, pending_parts, extra_ctx, actual_boards
 
             # ---- 主轮询循环: 回收完成板 → 增量检测 → 启动新 txt ----
             while queue or running_txts:
@@ -1512,8 +1661,7 @@ class TabFeedback(ttk.Frame):
                             self._shared_last_rescan = now
                             busy = self._busy_snapshot()
                             pool = self._pool_snapshot()
-                            in_use = busy | set(pool)
-                            # 增量检测: 只检测"未使用"的板
+                            pool_set = set(pool)
                             try:
                                 from concurrent.futures import ThreadPoolExecutor, as_completed
                                 from devboard_toolkit.config import load_boards
@@ -1523,12 +1671,13 @@ class TabFeedback(ttk.Frame):
                                 use_online = bool(self.use_online_var.get())
                                 all_board_names = [n for n in all_boards_cfg.keys()
                                                    if use_online or not n.lower().startswith("online")]
-                                # 只挑不在 in_use 中的板来检测
-                                to_check = [n for n in all_board_names if n not in in_use]
+                                # 检测: 不在 busy 中的板都检测 (含空闲池中的, 确认是否仍空闲)
+                                to_check = [n for n in all_board_names if n not in busy]
                                 if to_check:
-                                    print(f"\n  [扫] 增量检测 {len(to_check)} 块未使用板中... "
+                                    print(f"\n  [扫] 增量检测 {len(to_check)} 块板中... "
                                           f"(每 {BOARD_RESCAN_INTERVAL}s 一次)")
                                     newly_idle = []
+                                    gone_busy = []
                                     with ThreadPoolExecutor(max_workers=len(to_check)) as ex:
                                         futs = {ex.submit(check_usage_one, n, all_boards_cfg[n]): n
                                                 for n in to_check}
@@ -1537,47 +1686,97 @@ class TabFeedback(ttk.Frame):
                                                 break
                                             r = fut.result()
                                             if not r.busy:
-                                                newly_idle.append(r.name)
-                                                print(f"    [+] 新板上线: {r.name} ({r.host})")
+                                                if r.name not in pool_set:
+                                                    newly_idle.append(r.name)
+                                                    print(f"    [+] 新板上线: {r.name} ({r.host})")
+                                            else:
+                                                if r.name in pool_set:
+                                                    gone_busy.append(r.name)
+                                                    print(f"    [-] {r.name} 已被占用, 从空闲池移除 ({r.host})")
                                     if newly_idle:
-                                        # 新板加入池 + 标记为首次启动 (需 reboot)
                                         self._pool_add(newly_idle)
                                         for bn in newly_idle:
                                             self._board_first_run[bn] = True
                                         print(f"  [扫] 新增 {len(newly_idle)} 块空闲板, "
                                               f"当前空闲池共 {self._pool_size()} 块")
-                                    else:
-                                        print(f"  [扫] 无新空闲板, 保持现状")
+                                    if gone_busy:
+                                        for bn in gone_busy:
+                                            self._pool_remove(bn)
+                                        print(f"  [扫] 移除 {len(gone_busy)} 块已占用板, "
+                                              f"当前空闲池共 {self._pool_size()} 块")
+                                    if not newly_idle and not gone_busy:
+                                        print(f"  [扫] 无变化, 保持现状 (空闲池 {self._pool_size()} 块)")
                                 else:
-                                    print(f"\n  [扫] 所有板均已在使用或池中, 跳过增量检测")
+                                    print(f"\n  [扫] 所有板均在使用中, 跳过增量检测")
                             except Exception as e:
                                 print(f"  [扫] 增量检测异常: {e}")
                         finally:
                             self._rescan_lock.release()
 
                 # 1. 检查所有正在跑的 txt 的板完成情况
-                completed_this_round = []
+                #    完成板优先分配给同一 txt 的剩余分片(接力续跑), 无剩余才退回池
+                completed_boards_pool = []  # 最终退回共享池的板
+                boards_to_relay = []        # 待接力的板: [(board_name, txt_path)]
                 for txt_path, info in list(running_txts.items()):
                     still_running = []
                     for bn in info["boards"]:
                         safe_bn = bn.replace("/", "_").replace("\\", "_")
                         dp = os.path.join(log_dir, f"{safe_bn}.done")
                         if os.path.isfile(dp):
-                            completed_this_round.append(bn)
-                            print(f"    [✓] {bn} 完成 ({os.path.basename(txt_path)})")
+                            # 先尝试接力该 txt 的剩余分片
+                            if info.get("pending"):
+                                boards_to_relay.append((bn, txt_path))
+                                print(f"    [✓] {bn} 完成 ({os.path.basename(txt_path)}) "
+                                      f"→ 接力续跑 (还剩 {len(info['pending'])} 份)")
+                            else:
+                                completed_boards_pool.append(bn)
+                                print(f"    [✓] {bn} 完成 ({os.path.basename(txt_path)}) "
+                                      f"→ 该 txt 分片全部跑完, 退回空闲池")
                         else:
                             still_running.append(bn)
                     info["boards"] = still_running
-                    # 该 txt 所有板完成 → 标记完成
-                    if not still_running:
+                    # 该 txt 所有板完成 且 没有待接力分片 → 标记完成
+                    if not still_running and not info.get("pending"):
                         del running_txts[txt_path]
                         print(f"\n[+] {os.path.basename(txt_path)} 回灌完成 "
                               f"(剩余 {len(queue)} 个待回灌, {len(running_txts)} 个进行中)")
 
-                # 回收完成的板到空闲池 (板仍标记为"已使用过",下次 skip_reboot)
-                self._pool_return_batch(completed_this_round)
+                # 2. 处理接力续跑: 板直接续跑当前 txt 的下一个分片 (--no-reboot)
+                for board_name, txt_path in boards_to_relay:
+                    info = running_txts.get(txt_path)
+                    if not info or not info.get("pending"):
+                        completed_boards_pool.append(board_name)
+                        continue
+                    # 取出下一个待跑分片
+                    script_path, sub_file, line_cnt = info["pending"].pop(0)
+                    # 清理 .done 标记 (该板要立刻再跑)
+                    safe_bn = board_name.replace("/", "_").replace("\\", "_")
+                    dp = os.path.join(info["log_dir"], f"{safe_bn}.done")
+                    try:
+                        if os.path.isfile(dp):
+                            os.remove(dp)
+                    except Exception:
+                        pass
+                    # 启动: 同一 txt 接力 → 也 reboot (防止挂载残留)
+                    script_name = Path(script_path).name
+                    print(f"\n[接力] {board_name} 续跑 {os.path.basename(txt_path)} → "
+                          f"{script_name} ← {sub_file} ({line_cnt} 条) [reboot]")
+                    from devboard_toolkit.batch_replay import _launch_terminals
+                    _launch_terminals(
+                        _PROJECT_ROOT,
+                        [(board_name, info["replay_folder"], script_name)],
+                        log_dir=info["log_dir"],
+                        app_suffix=info["suffix"],
+                        delete_script=info["delete_script"],
+                        no_reboot_boards=set(),  # 不跳过 reboot
+                    )
+                    # 板重新加入该 txt 的在跑列表
+                    info["boards"].append(board_name)
 
-                # 2. 有空闲板且有待回灌 txt → 启动 (动态阈值判断)
+                # 回收无接力任务的完成板到空闲池
+                self._pool_return_batch(completed_boards_pool)
+
+                # 3. 有空闲板且有待回灌 txt → 启动 (动态阈值判断)
                 while self._pool_size() > 0 and queue:
                     pool_size = self._pool_size()
                     # === 动态阈值 ===
@@ -1608,6 +1807,43 @@ class TabFeedback(ttk.Frame):
                         break
 
                     next_txt = queue.pop(0)
+
+                    # === 每个新 txt 启动前重新检测空闲板 (增量检测, 不阻塞) ===
+                    try:
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        from devboard_toolkit.config import load_boards
+                        from devboard_toolkit.usage_check import check_usage_one
+
+                        all_boards_cfg = load_boards()
+                        use_online = bool(self.use_online_var.get())
+                        all_board_names = [n for n in all_boards_cfg.keys()
+                                           if use_online or not n.lower().startswith("online")]
+                        busy = self._busy_snapshot()
+                        pool = self._pool_snapshot()
+                        in_use = busy | set(pool)
+                        to_check = [n for n in all_board_names if n not in in_use]
+                        if to_check:
+                            print(f"\n  [txt前检测] 增量扫描 {len(to_check)} 块未使用板...")
+                            newly_idle = []
+                            with ThreadPoolExecutor(max_workers=len(to_check)) as ex:
+                                futs = {ex.submit(check_usage_one, n, all_boards_cfg[n]): n
+                                        for n in to_check}
+                                for fut in as_completed(futs):
+                                    if stop_event.is_set():
+                                        break
+                                    r = fut.result()
+                                    if not r.busy:
+                                        newly_idle.append(r.name)
+                            if newly_idle:
+                                self._pool_add(newly_idle)
+                                for bn in newly_idle:
+                                    self._board_first_run[bn] = True
+                                print(f"  [txt前检测] 新增 {len(newly_idle)} 块空闲板: "
+                                      f"{', '.join(newly_idle)} (当前池: {self._pool_size()})")
+                                pool_size = self._pool_size()
+                    except Exception as e:
+                        print(f"  [txt前检测] 增量检测异常: {e}")
+
                     try:
                         total_n = sum(1 for _ in open(next_txt, encoding="utf-8") if _.strip())
                     except Exception:
@@ -1615,22 +1851,53 @@ class TabFeedback(ttk.Frame):
                     # 取板数不超过用户选的板数(ctx["n"]), 避免多任务时一个任务占光所有板
                     n = min(pool_size, total_n, ctx["n"]) if total_n > 0 else min(pool_size, ctx["n"])
                     if n < 1:
-                        print(f"[!] 有效板数为 0, 跳过: {os.path.basename(next_txt)}")
-                        continue
+                        # 修复: pool_size 不足时把 txt 放回队列头部, 等下一轮板空闲再跑
+                        # (不能 continue 丢掉 txt)
+                        queue.insert(0, next_txt)
+                        print(f"[!] 空闲板不足, 暂缓: {os.path.basename(next_txt)} (放回队列头部)")
+                        break
                     boards_to_use = self._pool_take(n)
                     pool_size = self._pool_size()
-                    ok, per_target_used = _start_one_txt(next_txt, boards_to_use)
-                    if ok:
-                        running_txts[next_txt] = {
-                            "boards": list(boards_to_use),
+                    ok, per_target_used, pending_list, extra_ctx, actual_boards = (
+                        _start_one_txt(next_txt, boards_to_use)
+                    )
+                    if not ok:
+                        # 修复: ok=False 时退回板到池 + 把 txt 放回队列尾部 (而不是丢失)
+                        self._pool_return_batch(boards_to_use)
+                        queue.append(next_txt)
+                        print(f"[!] 启动失败, 已退回 {len(boards_to_use)} 块板, "
+                              f"txt 放回队列尾部: {os.path.basename(next_txt)}")
+                        continue
+                    running_txts[next_txt] = {
+                            "boards": list(actual_boards),
                             "round": round_counter,
                             "per_target": per_target_used,
+                            "pending": list(pending_list),
+                            "vars_map": extra_ctx.get("vars_map", {}),
+                            "car_model": extra_ctx.get("car_model", ""),
+                            "suffix": extra_ctx.get("suffix", ""),
+                            "delete_script": extra_ctx.get("delete_script", False),
+                            "log_dir": extra_ctx.get("log_dir", log_dir),
+                            "replay_folder": extra_ctx.get("replay_folder", ctx["replay_folder"]),
                         }
 
                 # 3. 没法启动新 txt → 等待板完成
                 pool_size = self._pool_size()
                 running_wait = len(running_txts)
-                pending_wait = len(queue)
+                pending_parts = sum(len(info.get("pending", [])) for info in running_txts.values())
+                queue_len = len(queue)
+                pending_wait = queue_len + pending_parts
+
+                # 待回灌分项描述 (消除噪音: 只有一种就不显示另一种)
+                if queue_len > 0 and pending_parts > 0:
+                    pending_desc = f"待回灌: {queue_len} 个新txt + {pending_parts} 份接力"
+                elif pending_parts > 0:
+                    pending_desc = f"待回灌: {pending_parts} 份接力"
+                elif queue_len > 0:
+                    pending_desc = f"待回灌: {queue_len} 个新txt"
+                else:
+                    pending_desc = "待回灌: 无"
+
                 if running_wait > 0:
                     # 显示当前阈值
                     if not running_txts:
@@ -1640,10 +1907,10 @@ class TabFeedback(ttk.Frame):
                                       for info in running_txts.values())
                         cur_thr = 1 if not any_big else 2
                     print(f"    等待中... 空闲 {pool_size} 块, 进行中 {running_wait} 个 txt, "
-                          f"待回灌 {pending_wait} 个 (阈值={cur_thr})")
+                          f"{pending_desc} (阈值={cur_thr})")
                     time.sleep(60)
                 elif pending_wait > 0 and pool_size == 0:
-                    print(f"    等待板空闲... 待回灌 {pending_wait} 个")
+                    print(f"    等待板空闲... {pending_desc}")
                     time.sleep(60)
                 elif pending_wait > 0 and pool_size > 0:
                     # 空闲板不够阈值且无在跑 → 下一轮循环会直接启动 (running_txts 为空阈值=1)
@@ -1652,10 +1919,281 @@ class TabFeedback(ttk.Frame):
             print(f"\n{'=' * 60}")
             print(f"  全部 {len(sorted_txts)} 个 txt 回灌完毕!")
             print(f"{'=' * 60}")
+
+            # === 合并所有分片的失败素材 ===
+            try:
+                import glob as _glob
+                failed_files = _glob.glob(os.path.join(unc_replay_folder, "replay_tmp", "failed_*.txt"))
+                if failed_files:
+                    all_failed = set()
+                    for ff in failed_files:
+                        try:
+                            with open(ff, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    line = line.strip()
+                                    if line:
+                                        all_failed.add(line)
+                        except Exception:
+                            pass
+                    if all_failed:
+                        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                        summary_path = os.path.join(log_dir, f"failed_all_{ts}.txt")
+                        with open(summary_path, "w", encoding="utf-8") as f:
+                            for item in sorted(all_failed):
+                                f.write(item + "\n")
+                        print(f"\n[!] 总失败素材: {len(all_failed)} 条 → 汇总: {summary_path}")
+                    else:
+                        print(f"\n[✓] 所有分片无失败素材")
+                else:
+                    print(f"\n[✓] 无失败素材文件")
+            except Exception as e:
+                print(f"[!] 合并失败素材出错: {e}")
+
             return 0
 
         else:
-            # ==== SDK 回灌 (单次, 不循环) ====
+            # ==== SDK 回灌 ====
+            sdk_video_path = ctx.get("sdk_video_path", "")
+
+            # ----------------------------------------------------------
+            # 视频路径有值 → 智能检测: 区分已预处理/未预处理
+            # ----------------------------------------------------------
+            if sdk_video_path:
+                print(f"\n{'=' * 60}")
+                print(f"  [智能检测] 视频路径: {sdk_video_path}")
+                print(f"{'=' * 60}")
+
+                # 遍历视频路径下所有 .h265/.h264
+                import glob as _glob
+                from devboard_toolkit.classify_by_car import _walk_video_files
+                all_videos = _walk_video_files(sdk_video_path)
+                print(f"  找到 {len(all_videos)} 个 .h265/.h264 文件")
+
+                if not all_videos:
+                    print("[!] 视频路径下没有 .h265/.h264 文件")
+                    return 1
+
+                # 检测每个文件是否已预处理
+                preprocessed = []    # 已预处理: 文件路径列表
+                unprocessed = []     # 未预处理: 文件路径列表
+                for vfp in all_videos:
+                    if self._check_preprocessed(vfp):
+                        preprocessed.append(vfp)
+                    else:
+                        unprocessed.append(vfp)
+
+                print(f"  已预处理: {len(preprocessed)} 个")
+                print(f"  未预处理: {len(unprocessed)} 个")
+
+                # === Step 1: 未预处理分支 (复制 + ADAS预处理 + 常规SDK回灌) ===
+                if unprocessed:
+                    print(f"\n{'=' * 60}")
+                    print(f"  [Step1] 未预处理素材: {len(unprocessed)} 个 → 复制+预处理+SDK回灌")
+                    print(f"{'=' * 60}")
+
+                    input_subpath = ctx["input_subpath"]
+                    if not input_subpath:
+                        print("[!] 未预处理素材需要素材相对路径, 请填写")
+                        return 1
+
+                    # 目标目录: UNC回灌路径/input/{USER}/{素材相对路径}/
+                    target_base = os.path.join(unc_replay_folder, "input", ctx["user"], input_subpath)
+                    os.makedirs(target_base, exist_ok=True)
+                    print(f"  目标目录: {target_base}")
+
+                    # 复制 .h265/.h264 并创建同名父文件夹
+                    import shutil
+                    for vfp in unprocessed:
+                        fname = os.path.basename(vfp)
+                        # 创建同名父文件夹 (去掉扩展名)
+                        name_no_ext = os.path.splitext(fname)[0]
+                        target_dir = os.path.join(target_base, name_no_ext)
+                        os.makedirs(target_dir, exist_ok=True)
+                        dst_file = os.path.join(target_dir, fname)
+                        if os.path.isfile(dst_file):
+                            print(f"    [跳过] {fname} (已存在)")
+                            continue
+                        shutil.copy2(vfp, dst_file)
+                        print(f"    [复制] {fname} → {name_no_ext}/")
+
+                    # 调用 ADAS 预处理 (后台调用, 日志输出到当前面板)
+                    print(f"\n  [*] 启动 ADAS 预处理...")
+                    from devboard_toolkit.data_preproc.pipeline import data_preproc_main
+                    rc_pre = data_preproc_main(
+                        txt_path=target_base,
+                        output_dir=target_base,
+                        mode="2",  # 视频路径模式
+                        create_jira_folder=False,
+                        classify_category=False,
+                        run_preprocessing_flag=True,
+                        max_workers=8,
+                        car_type=3,
+                        generate_mcap=False,
+                        stop_event=stop_event,
+                        create_file_folder=True,
+                        keep_largest_suffix=False,
+                    )
+                    if stop_event.is_set():
+                        return 2
+                    if rc_pre != 0:
+                        print(f"[!] ADAS 预处理失败 (rc={rc_pre}), 继续 SDK 回灌")
+                    else:
+                        print(f"  [+] ADAS 预处理完成")
+
+                    # 常规 SDK 回灌
+                    print(f"\n  [*] 启动常规 SDK 回灌 ({ctx['n']} 块板)...")
+                    template = load_replay_sdk_template()
+                    if not template:
+                        print("[!] config.yaml 中未找到 replay_sdk_template")
+                        return 1
+                    n_sdk = ctx["n"]
+                    scripts = []
+                    v = dict(vars_map)
+                    v["INPUT_SUBPATH"] = input_subpath
+                    content = _render_template(template, v)
+                    content = content.replace("\r\n", "\n").replace("\r", "\n")
+                    for i in range(1, n_sdk + 1):
+                        filename = f"start_sdk_{ctx['car_model']}_{i}.sh"
+                        safe = filename.replace("/", "_").replace(":", "_").replace(" ", "_")
+                        out_path = Path(unc_replay_folder) / safe
+                        out_path.write_text(content, encoding="utf-8", newline="\n")
+                        scripts.append(str(out_path))
+                        print(f"    {i}. {filename}")
+
+                    if scripts:
+                        self.after(0, lambda: self.script_path.set(scripts[0]))
+
+                    print(f"\n  [*] 检测空闲板 (排除已被其他任务占用的板)...")
+                    idle = self._sync_detect_boards(stop_event, exclude_busy=True)
+                    if stop_event.is_set():
+                        return 2
+                    if not idle:
+                        print("[!] 没有空闲板, 结束 SDK 回灌")
+                        return 1
+                    self._pool_add(idle)
+                    board_names = self._pool_take(n_sdk)
+                    if len(board_names) < n_sdk:
+                        print(f"[!] 空闲板不足: 需要 {n_sdk} 块, 可用 {len(board_names)} 块")
+                        if not board_names:
+                            return 1
+                    print(f"  [+] 分配 {len(board_names)} 块板: {', '.join(board_names)}")
+
+                    assignments = []
+                    for i, board_name in enumerate(board_names):
+                        script_name = Path(scripts[i]).name if i < len(scripts) else Path(scripts[-1]).name
+                        assignments.append((board_name, ctx["replay_folder"], script_name))
+
+                    os.makedirs(log_dir, exist_ok=True)
+                    for bn in board_names:
+                        safe_bn = bn.replace("/", "_").replace("\\", "_")
+                        dp = os.path.join(log_dir, f"{safe_bn}.done")
+                        if os.path.isfile(dp):
+                            try:
+                                os.remove(dp)
+                            except Exception:
+                                pass
+
+                    from devboard_toolkit.batch_replay import _launch_terminals
+                    _launch_terminals(
+                        _PROJECT_ROOT, assignments,
+                        log_dir=log_dir, app_suffix=suffix,
+                        delete_script=delete_script,
+                    )
+                    print(f"\n  [+] SDK 回灌已启动 ({len(board_names)} 块板)")
+
+                # === Step 2: 已预处理分支 (classify_by_car 生成 txt → 列表回灌) ===
+                if preprocessed:
+                    print(f"\n{'=' * 60}")
+                    print(f"  [Step2] 已预处理素材: {len(preprocessed)} 个 → 列表回灌")
+                    print(f"{'=' * 60}")
+
+                    # 把已预处理素材的**所在目录**去重 (classify_by_car 会递归遍历)
+                    # 先写一个临时 txt 列出所有已预处理视频的所在目录, 再让 classify_by_car 扫描
+                    # 但 classify_by_car 需要一个根目录, 这里直接把 sdk_video_path 传进去
+                    # 它内部会遍历所有 .h265/.h264, 但已预处理和未预处理的都会被扫到
+                    # 所以需要: 只让已预处理的文件进入列表回灌
+                    # 方案: 直接在 unc_replay_folder 下生成一个 txt, 手动写入已预处理的 Linux 路径
+                    from devboard_toolkit.classify_by_car import normalize_path, _classify_one, CAR_KEYWORDS
+                    from collections import defaultdict
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    print(f"  [*] 对已预处理素材按车型分类 ({len(preprocessed)} 个)...")
+                    car_map_pp = defaultdict(list)
+                    unknown_pp = []
+                    with ThreadPoolExecutor(max_workers=32) as ex:
+                        futs = {ex.submit(_classify_one, fp): fp for fp in preprocessed}
+                        total_pp = len(futs)
+                        done_pp = 0
+                        for fut in as_completed(futs):
+                            if stop_event.is_set():
+                                break
+                            linux_path, car = fut.result()
+                            if car == "unknown":
+                                unknown_pp.append(linux_path)
+                            else:
+                                car_map_pp[car].append(linux_path)
+                            done_pp += 1
+                            if done_pp % 500 == 0 or done_pp == total_pp:
+                                print(f"    进度: {done_pp}/{total_pp}")
+
+                    # 写 txt
+                    output_txts_pp = []
+                    for car, paths in sorted(car_map_pp.items()):
+                        fname_pp = f"{ctx['user']}_{car}.txt"
+                        fpath_pp = os.path.join(unc_replay_folder, fname_pp)
+                        with open(fpath_pp, "w", encoding="utf-8") as f:
+                            for p in paths:
+                                f.write(p + "\n")
+                        output_txts_pp.append((fpath_pp, len(paths)))
+                        print(f"    {fname_pp:30s}: {len(paths):5d} 条")
+
+                    if unknown_pp:
+                        fpath_unk = os.path.join(unc_replay_folder, "error_unknown.txt")
+                        with open(fpath_unk, "w", encoding="utf-8") as f:
+                            for p in unknown_pp:
+                                f.write(p + "\n")
+                        print(f"    {'error_unknown.txt':30s}: {len(unknown_pp):5d} 条 (暂不回灌)")
+
+                    # 按条数升序
+                    output_txts_pp.sort(key=lambda x: x[1])
+                    sorted_txts_pp = [fp for fp, _ in output_txts_pp]
+
+                    if not sorted_txts_pp:
+                        print("[!] 没有可回灌的已预处理 txt")
+                    else:
+                        # 构造列表回灌的 ctx 并递归调用 _do_start_task
+                        list_ctx2 = dict(ctx)
+                        list_ctx2["mode"] = "list"
+                        list_ctx2["list_input_mode"] = "txt"
+                        # 多个 txt 合并为一个大 txt (列表回灌内部会自适应切分)
+                        if len(sorted_txts_pp) == 1:
+                            list_ctx2["list_input_path"] = sorted_txts_pp[0]
+                        else:
+                            merged_path = os.path.join(unc_replay_folder, f"{ctx['user']}_merged.txt")
+                            with open(merged_path, "w", encoding="utf-8") as mf:
+                                for tp in sorted_txts_pp:
+                                    with open(tp, encoding="utf-8") as tf:
+                                        for line in tf:
+                                            if line.strip():
+                                                mf.write(line)
+                            list_ctx2["list_input_path"] = merged_path
+                            print(f"  [i] 多个 txt 合并为: {os.path.basename(merged_path)}")
+
+                        print(f"\n  [*] 启动列表回灌 ({len(sorted_txts_pp)} 个 txt)...")
+                        rc_list = self._do_start_task(list_ctx2, stop_event)
+                        if rc_list != 0:
+                            print(f"[!] 列表回灌失败 (rc={rc_list})")
+
+                if not preprocessed and not unprocessed:
+                    print("[!] 视频路径下没有 .h265/.h264 文件")
+                    return 1
+
+                print(f"\n[+] SDK 智能检测回灌完成")
+                return 0
+
+            # ----------------------------------------------------------
+            # 无视频路径 → 常规 SDK 回灌 (原逻辑)
+            # ----------------------------------------------------------
             template = load_replay_sdk_template()
             if not template:
                 print("[!] config.yaml 中未找到 replay_sdk_template")
@@ -1721,59 +2259,85 @@ class TabFeedback(ttk.Frame):
             print("\n[+] 已启动多终端回灌,请在各终端窗口观察输出")
             return 0
 
+    def _check_preprocessed(self, video_file: str) -> bool:
+        """检测素材是否已预处理
+
+        判定条件 (全部满足才算已预处理):
+        1. .h265/.h264 本身非空 (size > 0)
+        2. 同目录下存在同名 .bin 且非空
+        3. 同目录下存在同名 .mp4 且非空
+        4. 同目录下 log/ 文件夹存在且非空 (log 内为 txt 文件)
+        """
+        import os as _os
+        try:
+            # 条件1: 视频文件本身非空
+            if _os.path.getsize(video_file) == 0:
+                return False
+
+            base_dir = _os.path.dirname(video_file)
+            name_no_ext = _os.path.splitext(_os.path.basename(video_file))[0]
+
+            # 条件2: 同名 .bin 存在且非空
+            bin_path = _os.path.join(base_dir, name_no_ext + ".bin")
+            if not _os.path.isfile(bin_path) or _os.path.getsize(bin_path) == 0:
+                return False
+
+            # 条件3: 同名 .mp4 存在且非空
+            mp4_path = _os.path.join(base_dir, name_no_ext + ".mp4")
+            if not _os.path.isfile(mp4_path) or _os.path.getsize(mp4_path) == 0:
+                return False
+
+            # 条件4: 同目录下 log/ 文件夹存在且非空 (内容为 txt 文件)
+            log_dir = _os.path.join(base_dir, "log")
+            if not _os.path.isdir(log_dir):
+                return False
+            log_files = [_os.path.join(log_dir, f) for f in _os.listdir(log_dir)]
+            if not log_files:
+                return False
+
+            return True
+        except (OSError, PermissionError):
+            return False
+
+    def _refresh_stop_combo(self):
+        """刷新停止任务下拉框: 实时加载正在运行的任务名"""
+        running = {tid: t for tid, t in self._tasks.items()
+                   if t.get("status") == "running" and t["thread"].is_alive()}
+        values = list(running.keys())
+        if len(values) > 1:
+            values.append("全部停止")
+        self._stop_task_combo["values"] = values
+        if values:
+            cur = self._stop_task_var.get()
+            if not cur or cur not in values:
+                self._stop_task_var.set(values[0])
+        else:
+            self._stop_task_var.set("")
+
     def _on_stop(self):
-        """多任务并发模式: 弹窗选择要停止的任务"""
+        """多任务并发模式: 通过下拉框选择要停止的任务"""
         running = {tid: t for tid, t in self._tasks.items()
                    if t.get("status") == "running" and t["thread"].is_alive()}
         if not running:
             self.log_panel.log("没有正在运行的任务", "info")
             return
 
-        if len(running) == 1:
-            tid = list(running.keys())[0]
-            running[tid]["stop_event"].set()
-            self.log_panel.log(f"[{tid}] 用户中止回灌", "err")
-            return
-
-        # 多个任务在跑: 弹窗选择
-        import tkinter as tk_dialog
-        from tkinter import ttk as ttk_dialog
-        dialog = tk_dialog.Toplevel(self.winfo_toplevel())
-        dialog.title("选择要停止的任务")
-        dialog.geometry("450x300")
-        dialog.transient(self.winfo_toplevel())
-        dialog.grab_set()
-
-        ttk_dialog.Label(dialog, text="选择要停止的任务:").pack(pady=8)
-
-        selected = tk_dialog.StringVar(value=list(running.keys())[0])
-        for tid, t in running.items():
-            ctx = t["ctx"]
-            rb = ttk_dialog.Radiobutton(
-                dialog,
-                text=f"{tid} - {ctx['mode']} - {ctx['replay_folder']} - {ctx['car_model']}",
-                value=tid, variable=selected)
-            rb.pack(anchor="w", padx=20, pady=2)
-
-        btns = ttk_dialog.Frame(dialog)
-        btns.pack(pady=10)
-
-        def _stop_selected():
-            tid = selected.get()
-            if tid in running:
-                running[tid]["stop_event"].set()
-                self.log_panel.log(f"[{tid}] 用户中止回灌", "err")
-            dialog.destroy()
-
-        def _stop_all():
+        selected = self._stop_task_var.get().strip()
+        if selected == "全部停止":
             for tid, t in running.items():
                 t["stop_event"].set()
                 self.log_panel.log(f"[{tid}] 用户中止回灌", "err")
-            dialog.destroy()
+            return
 
-        ttk_dialog.Button(btns, text="停止选中", command=_stop_selected).pack(side="left", padx=8)
-        ttk_dialog.Button(btns, text="全部停止", command=_stop_all).pack(side="left", padx=8)
-        ttk_dialog.Button(btns, text="取消", command=dialog.destroy).pack(side="left", padx=8)
+        if selected and selected in running:
+            running[selected]["stop_event"].set()
+            self.log_panel.log(f"[{selected}] 用户中止回灌", "err")
+        elif len(running) == 1:
+            tid = list(running.keys())[0]
+            running[tid]["stop_event"].set()
+            self.log_panel.log(f"[{tid}] 用户中止回灌", "err")
+        else:
+            self.log_panel.log("请从下拉框选择要停止的任务", "warn")
 
     def _on_open_dir(self):
         if not self._replay_folder or not self._unc_testbed:
@@ -1797,26 +2361,23 @@ class TabPipeline(ttk.Frame):
     def __init__(self, master):
         super().__init__(master, padding=12)
 
-        # 全局选项: 是否启用感知包自动编译 (决定 need_build 和 节点是否启用)
-        global_row = ttk.Frame(self)
-        global_row.pack(fill="x")
-        self.v_auto_build = tk.BooleanVar(value=True)
-        self._cb_auto_build = ttk.Checkbutton(
-            global_row, text="启用感知包自动编译 (取消则直接使用回灌环境中已有的感知包)",
-            variable=self.v_auto_build,
-            command=self._on_auto_build_toggle)
-        self._cb_auto_build.pack(side="left")
-        ttk.Button(global_row, text="🔄 刷新配置摘要",
+        # 顶部操作行
+        head = ttk.Frame(self)
+        head.pack(fill="x")
+        ttk.Label(head, text="可自由组合节点(支持任意组合), 默认仅启用「③ 自动回灌」",
+                  style="Hint.TLabel").pack(side="left")
+        ttk.Button(head, text="🔄 刷新配置摘要",
                    command=self._refresh_summary).pack(side="right")
 
-        # 节点选择 (数据处理 + 自动回灌 必选, 感知包编译取决于全局开关)
-        flow = ttk.LabelFrame(self, text="流水线节点 (数据处理 + 自动回灌 必选)",
+        # 节点选择 (全部可自由勾选)
+        flow = ttk.LabelFrame(self, text="流水线节点 (任选组合)",
                               style="Card.TLabelframe")
         flow.pack(fill="x", pady=(12, 0))
 
+        # 默认: 仅 ③自动回灌 勾选
         self.nodes = [
-            ("n1", "① 数据处理",       True),
-            ("n2", "② 感知包编译",     True),
+            ("n1", "① 数据处理",       False),
+            ("n2", "② 感知包编译",     False),
             ("n3", "③ 自动回灌",       True),
         ]
         self.node_vars = {}
@@ -1824,8 +2385,7 @@ class TabPipeline(ttk.Frame):
         for i, (key, label, default) in enumerate(self.nodes):
             var = tk.BooleanVar(value=default)
             self.node_vars[key] = var
-            cb = ttk.Checkbutton(flow, text=label, variable=var,
-                                 state="disabled" if key in ("n1", "n3") else "normal")
+            cb = ttk.Checkbutton(flow, text=label, variable=var, state="normal")
             cb.grid(row=0, column=i, padx=12, pady=4, sticky="w")
             self._node_cbs[key] = cb
             flow.columnconfigure(i, weight=1)
@@ -1843,16 +2403,6 @@ class TabPipeline(ttk.Frame):
             hint_var = tk.StringVar(value="(未刷新)")
             self._summary_labels[key] = hint_var
             ttk.Label(row, textvariable=hint_var, style="Hint.TLabel").pack(side="left", padx=(6, 0))
-
-        # 失败策略
-        strat = ttk.Frame(self)
-        strat.pack(fill="x", pady=12)
-        ttk.Label(strat, text="失败策略:", width=12, anchor="w").pack(side="left")
-        self.fail_var = tk.StringVar(value="遇到失败停止")
-        ttk.Combobox(strat, textvariable=self.fail_var, state="readonly", width=22,
-                     values=["遇到失败继续下一个节点",
-                             "遇到失败停止",
-                             "失败节点自动重试 3 次"]).pack(side="left")
 
         # 按钮栏
         btns = ttk.Frame(self)
@@ -1880,16 +2430,6 @@ class TabPipeline(ttk.Frame):
         # 初始刷新一次
         self.after(300, self._refresh_summary)
 
-    def _on_auto_build_toggle(self):
-        """切换「启用自动编译」: 节点②复选框可用状态联动"""
-        if self.v_auto_build.get():
-            self._node_cbs["n2"].configure(state="normal")
-            self.node_vars["n2"].set(True)
-        else:
-            self._node_cbs["n2"].configure(state="disabled")
-            self.node_vars["n2"].set(False)
-        self._refresh_summary()
-
     def _refresh_summary(self):
         """读取其他 Tab 控件值,刷新摘要显示"""
         try:
@@ -1915,7 +2455,7 @@ class TabPipeline(ttk.Frame):
         )
 
         # 节点② 感知包编译
-        build_on = self.v_auto_build.get()
+        build_on = bool(self.node_vars["n2"].get())
         if build_on:
             from devboard_toolkit.config import load_jenkins
             jenkins_cfg = load_jenkins()
@@ -1927,7 +2467,7 @@ class TabPipeline(ttk.Frame):
             )
         else:
             self._summary_labels["n2"].set(
-                f"(已关闭自动编译 → 直接使用回灌环境中现有 runtime + 感知包)"
+                f"(节点未勾选 → 直接使用回灌环境中现有 runtime + 感知包)"
             )
 
         # 节点③ 自动回灌
@@ -1952,11 +2492,18 @@ class TabPipeline(ttk.Frame):
             self._summary_labels["n3"].set(
                 f"方式={f_mode} | 回灌环境={env_name} | 车型={car} | 用户={user} | 感知包={pkg} | 素材={sp}"
             )
+        # 节点未勾选时统一提示
+        for key in ("n1", "n2", "n3"):
+            if not self.node_vars[key].get():
+                self._summary_labels[key].set("(节点未勾选 → 跳过)")
 
     def _on_start(self):
-        # n1 和 n3 必选
-        if not (self.node_vars["n1"].get() and self.node_vars["n3"].get()):
-            messagebox.showwarning("提示", "数据处理 + 自动回灌 是必选节点")
+        run_data = bool(self.node_vars["n1"].get())
+        run_build = bool(self.node_vars["n2"].get())
+        run_feed = bool(self.node_vars["n3"].get())
+        # 至少勾选 1 个节点
+        if not (run_data or run_build or run_feed):
+            messagebox.showwarning("提示", "请至少勾选一个流水线节点")
             return
         if self._thread and self._thread.is_alive():
             messagebox.showwarning("提示", "流水线正在运行中")
@@ -1967,8 +2514,8 @@ class TabPipeline(ttk.Frame):
         self.log_panel.text.delete("1.0", "end")
         self.log_panel.text.configure(state="disabled")
 
-        run_build = self.v_auto_build.get() and self.node_vars["n2"].get()
-        fail_strategy = self.fail_var.get()
+        # 实际参与节点 (用于进度条计算)
+        step_nodes = [k for k, v in (("n1", run_data), ("n2", run_build), ("n3", run_feed)) if v]
 
         def _task(stop_event):
             app = self.master.master
@@ -1978,33 +2525,39 @@ class TabPipeline(ttk.Frame):
             stop = stop_event
 
             # ============================================================
-            # Step 0: 校验所有必需项
+            # Step 0: 校验所有勾选节点的必需项
             # ============================================================
             print("=" * 60)
-            print("  Step 0: 参数校验")
+            print("  Step 0: 参数校验 (勾选节点:",
+                  ", ".join(step_nodes) or "无", ")")
             print("=" * 60)
 
-            # Tab1 数据处理校验
-            txt_path = tab_data.txt_path.get()
-            if not txt_path:
-                print("[!] Tab1(数据处理) 未选择 素材输入")
-                return 1
-            mode_val = tab_data.mode_var.get()
-            if mode_val in ("jira", "batch"):
-                if not os.path.isfile(txt_path):
-                    print(f"[!] Tab1 输入不是有效文件: {txt_path}")
+            mode_val = None
+            txt_path = None
+            if run_data:
+                # Tab1 数据处理校验
+                txt_path = tab_data.txt_path.get()
+                if not txt_path:
+                    print("[!] Tab1(数据处理) 未选择 素材输入")
                     return 1
-            elif mode_val == "video":
-                if not os.path.isdir(txt_path):
-                    print(f"[!] Tab1 输入不是有效文件夹: {txt_path}")
+                mode_val = tab_data.mode_var.get()
+                if mode_val in ("jira", "batch"):
+                    if not os.path.isfile(txt_path):
+                        print(f"[!] Tab1 输入不是有效文件: {txt_path}")
+                        return 1
+                elif mode_val == "video":
+                    if not os.path.isdir(txt_path):
+                        print(f"[!] Tab1 输入不是有效文件夹: {txt_path}")
+                        return 1
+                if not tab_data.out_dir.get():
+                    print("[!] Tab1(数据处理) 未填写 输出目录")
                     return 1
-            if not tab_data.out_dir.get():
-                print("[!] Tab1(数据处理) 未填写 输出目录")
-                return 1
-            print(f"  [✓] Tab1 数据处理: 模式={mode_val} 输入={txt_path}")
+                print(f"  [✓] Tab1 数据处理: 模式={mode_val} 输入={txt_path}")
+            else:
+                print("  [跳过] Tab1 数据处理 (节点未勾选)")
 
-            # Tab2 编译校验 (启用才校验)
             if run_build:
+                # Tab2 编译校验 (启用才校验)
                 sdk_zip = tab_build.sdk_zip.get()
                 if not sdk_zip or not os.path.isfile(sdk_zip):
                     print("[!] Tab2(感知包编译) 未选择 SDK zip 或文件不存在")
@@ -2013,271 +2566,304 @@ class TabPipeline(ttk.Frame):
                     print("[!] Tab2(感知包编译) 未填写 输出回灌目录")
                     return 1
                 print(f"  [✓] Tab2 感知包编译: SDK={os.path.basename(sdk_zip)} 输出={tab_build.out_dir.get()}")
-
-            # Tab3 回灌校验
-            if not tab_feed.env_var.get():
-                print("[!] Tab3(自动回灌) 未选择 回灌环境")
-                return 1
-            if not getattr(tab_feed, "_unc_testbed", ""):
-                print("[!] Tab3 回灌环境尚未扫描完成,请稍后再试")
-                return 1
-            if not tab_feed.car_var.get():
-                print("[!] Tab3(自动回灌) 未选车型")
-                return 1
-            if not tab_feed.pkg_var.get():
-                print("[!] Tab3(自动回灌) 未选感知包")
-                return 1
-            car_values = list(tab_feed.car_combo["values"])
-            car_model_idx = tab_feed.car_combo.current()
-            if car_model_idx < 0 or car_model_idx >= len(car_values):
-                print("[!] Tab3(自动回灌) 车型-校准映射 索引非法")
-                return 1
-            if tab_feed._mode_var.get() == "sdk":
-                if not tab_feed.sdk_user_var.get():
-                    print("[!] SDK 回灌未填用户名")
-                    return 1
-                if not tab_feed.sdk_path_var.get():
-                    print("[!] SDK 回灌未填素材相对路径")
-                    return 1
             else:
-                list_mode = tab_feed._list_input_mode.get()
-                list_in = tab_feed.list_txt_row.get()
-                if not list_in:
-                    print("[!] 列表回灌未选择素材输入")
+                print("  [跳过] Tab2 感知包编译 (节点未勾选)")
+
+            if run_feed:
+                # Tab3 回灌校验
+                if not tab_feed.env_var.get():
+                    print("[!] Tab3(自动回灌) 未选择 回灌环境")
                     return 1
-                if list_mode == "txt" and not os.path.isfile(list_in):
-                    print(f"[!] 列表回灌素材 txt 不存在: {list_in}")
+                if not getattr(tab_feed, "_unc_testbed", ""):
+                    print("[!] Tab3 回灌环境尚未扫描完成,请稍后再试")
                     return 1
-                if list_mode == "video" and not os.path.isdir(list_in):
-                    print(f"[!] 列表回灌视频路径不存在: {list_in}")
+                if not tab_feed.car_var.get():
+                    print("[!] Tab3(自动回灌) 未选车型")
                     return 1
-                if not tab_feed.list_user_var.get():
-                    print("[!] 列表回灌未填用户名")
+                if not tab_feed.pkg_var.get():
+                    print("[!] Tab3(自动回灌) 未选感知包")
                     return 1
-                if not tab_feed.list_date_var.get():
-                    print("[!] 列表回灌未填日期")
+                car_values = list(tab_feed.car_combo["values"])
+                car_model_idx = tab_feed.car_combo.current()
+                if car_model_idx < 0 or car_model_idx >= len(car_values):
+                    print("[!] Tab3(自动回灌) 车型-校准映射 索引非法")
                     return 1
-            # fcf: 校验选中的版本
-            fcf_values = list(tab_feed.cal_combo["values"])
-            fcf_idx = tab_feed.cal_combo.current()
-            if fcf_idx < 0 or fcf_idx >= len(fcf_values):
-                print("[!] Tab3(自动回灌) fcf 校准版本未选")
-                return 1
-            print(f"  [✓] Tab3 自动回灌: 方式={tab_feed._mode_var.get()} "
-                  f"环境={tab_feed.env_var.get()} fcf版本={fcf_values[fcf_idx]}")
+                if tab_feed._mode_var.get() == "sdk":
+                    if not tab_feed.sdk_user_var.get():
+                        print("[!] SDK 回灌未填用户名")
+                        return 1
+                    if not tab_feed.sdk_path_var.get():
+                        print("[!] SDK 回灌未填素材相对路径")
+                        return 1
+                else:
+                    list_mode = tab_feed._list_input_mode.get()
+                    list_in = tab_feed.list_txt_row.get()
+                    if not list_in:
+                        print("[!] 列表回灌未选择素材输入")
+                        return 1
+                    if list_mode == "txt" and not os.path.isfile(list_in):
+                        print(f"[!] 列表回灌素材 txt 不存在: {list_in}")
+                        return 1
+                    if list_mode == "video" and not os.path.isdir(list_in):
+                        print(f"[!] 列表回灌视频路径不存在: {list_in}")
+                        return 1
+                    if not tab_feed.list_user_var.get():
+                        print("[!] 列表回灌未填用户名")
+                        return 1
+                    if not tab_feed.list_date_var.get():
+                        print("[!] 列表回灌未填日期")
+                        return 1
+                # fcf: 校验选中的版本
+                fcf_values = list(tab_feed.cal_combo["values"])
+                fcf_idx = tab_feed.cal_combo.current()
+                if fcf_idx < 0 or fcf_idx >= len(fcf_values):
+                    print("[!] Tab3(自动回灌) fcf 校准版本未选")
+                    return 1
+                print(f"  [✓] Tab3 自动回灌: 方式={tab_feed._mode_var.get()} "
+                      f"环境={tab_feed.env_var.get()} fcf版本={fcf_values[fcf_idx]}")
+            else:
+                print("  [跳过] Tab3 自动回灌 (节点未勾选)")
 
             # ============================================================
-            # Step 1: 并行: [数据处理] + [感知包编译(可选)]
+            # Step 1: 并行: [数据处理(可选)] + [感知包编译(可选)]
             # ============================================================
-            print("\n" + "=" * 60)
-            build_tag = " + 感知包编译(并行)" if run_build else ""
-            print(f"  Step 1: 数据处理{build_tag}")
-            print("=" * 60)
-
-            def _run_data_preproc():
-                """节点① 数据处理"""
-                from devboard_toolkit.data_preproc.pipeline import data_preproc_main
-                mode_map = {"jira": "1", "video": "2", "batch": "3"}
-                mode = mode_map.get(mode_val, "1")
-                rc = data_preproc_main(
-                    txt_path=txt_path,
-                    output_dir=tab_data.out_dir.get(),
-                    mode=mode,
-                    create_jira_folder=tab_data.v_create_dir.get(),
-                    classify_category=tab_data.v_classify.get(),
-                    run_preprocessing_flag=tab_data.v_adas.get(),
-                    max_workers=tab_data.workers_var.get(),
-                    car_type=int(tab_data.car_type_var.get().split(" - ")[0]) if tab_data.car_type_var.get().strip() else 3,
-                    generate_mcap=(tab_data.mcap_var.get() == "是"),
-                    stop_event=stop,
-                    create_file_folder=tab_data.v_file_folder.get(),
-                    keep_largest_suffix=tab_data.v_keep_largest.get(),
-                )
-                return rc
-
-            def _run_build():
-                """节点② 感知包编译"""
-                project_root = os.path.dirname(os.path.dirname(__file__))
-                if project_root not in sys.path:
-                    sys.path.insert(0, project_root)
-                from jenkins_build import auto_build_main
-                app_name, rc = auto_build_main(
-                    sdk_zip_path=tab_build.sdk_zip.get(),
-                    replay_dir=tab_build.out_dir.get() or None,
-                )
-                return app_name, rc
-
-            step1_failed = False
-            cancelled = False
-
-            # ThreadPoolExecutor 并行 (2 个任务足够用)
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                future_map = {}
-                future_map[ex.submit(_run_data_preproc)] = ("① 数据处理", None)
+            step1_enabled = run_data or run_build
+            if step1_enabled:
+                print("\n" + "=" * 60)
+                tags = []
+                if run_data:
+                    tags.append("① 数据处理")
                 if run_build:
-                    future_map[ex.submit(_run_build)] = ("② 感知包编译", None)
+                    tags.append("② 感知包编译(并行)")
+                print(f"  Step 1: {' + '.join(tags)}")
+                print("=" * 60)
 
-                for fut in as_completed(future_map):
-                    if stop.is_set():
-                        cancelled = True
-                        break
-                    tag, _ = future_map[fut]
-                    try:
-                        res = fut.result()
-                    except Exception as e:
-                        print(f"\n[!] {tag} 抛出异常: {e}")
-                        import traceback; traceback.print_exc()
-                        step1_failed = True
-                        continue
-                    if tag == "① 数据处理":
-                        rc_d = res
-                        if rc_d == 2:
-                            print(f"[!] {tag} 已取消")
-                            cancelled = True
-                        elif rc_d != 0:
-                            print(f"[!] {tag} 失败")
-                            step1_failed = True
-                        else:
-                            print(f"[+] {tag} 完成")
-                    else:  # ② 感知包编译
-                        app_name_b, rc_b = res
-                        if rc_b != 0:
-                            print(f"[!] {tag} 失败")
-                            step1_failed = True
-                        else:
-                            print(f"[+] {tag} 完成,感知包名={app_name_b}")
-                            # 编译完成后重新扫描一次 Tab3 感知包下拉 (异步切回主线程刷新)
-                            try:
-                                self.after(0, lambda: tab_feed._on_select_env())
-                            except Exception:
-                                pass
+                def _run_data_preproc():
+                    """节点① 数据处理"""
+                    from devboard_toolkit.data_preproc.pipeline import data_preproc_main
+                    mode_map = {"jira": "1", "video": "2", "batch": "3"}
+                    mode = mode_map.get(mode_val, "1")
+                    rc = data_preproc_main(
+                        txt_path=txt_path,
+                        output_dir=tab_data.out_dir.get(),
+                        mode=mode,
+                        create_jira_folder=tab_data.v_create_dir.get(),
+                        classify_category=tab_data.v_classify.get(),
+                        run_preprocessing_flag=tab_data.v_adas.get(),
+                        max_workers=tab_data.workers_var.get(),
+                        car_type=int(tab_data.car_type_var.get().split(" - ")[0]) if tab_data.car_type_var.get().strip() else 3,
+                        generate_mcap=(tab_data.mcap_var.get() == "是"),
+                        stop_event=stop,
+                        create_file_folder=tab_data.v_file_folder.get(),
+                        keep_largest_suffix=tab_data.v_keep_largest.get(),
+                    )
+                    return rc
 
-            if cancelled:
-                print("\n[!] 用户取消 Step1,流水线终止")
-                return 2
-            if step1_failed and "停止" in fail_strategy:
-                print("[!] Step1 有失败节点,失败策略=停止 → 流水线终止")
-                return 1
+                def _run_build():
+                    """节点② 感知包编译"""
+                    project_root = _PROJECT_ROOT
+                    if project_root not in sys.path:
+                        sys.path.insert(0, project_root)
+                    from jenkins_build import auto_build_main
+                    app_name, rc = auto_build_main(
+                        sdk_zip_path=tab_build.sdk_zip.get(),
+                        replay_dir=tab_build.out_dir.get() or None,
+                    )
+                    return app_name, rc
 
-            # ============================================================
-            # Step 2: 回灌环境完整性检测
-            # ============================================================
-            print("\n" + "=" * 60)
-            print(f"  Step 2: 回灌环境完整性检测 (need_build={run_build})")
-            print("=" * 60)
+                step1_failed = False
+                cancelled = False
 
-            # 构造完整 UNC 回灌路径 (和 Tab3._do_start_task 一致)
-            # _unc_testbed 已由 tab3 的 _on_scan_envs 设置好
-            env_name = tab_feed.env_var.get()
-            unc_testbed = tab_feed._unc_testbed
-            unc_replay_folder = os.path.normpath(os.path.join(unc_testbed, env_name))
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    future_map = {}
+                    if run_data:
+                        future_map[ex.submit(_run_data_preproc)] = ("① 数据处理", None)
+                    if run_build:
+                        future_map[ex.submit(_run_build)] = ("② 感知包编译", None)
 
-            # fcf 标定源目录 (和 Tab3._do_start_task 一致: tool/fcf_calibration/<version>)
-            fcf_ver = tab_feed.cal_var.get()
-            fcf_src_dir = None
-            if fcf_ver and fcf_ver != "default":
-                try:
-                    from devboard_toolkit.batch_replay import _project_tool_dir
-                    fcf_src_dir = os.path.join(
-                        _project_tool_dir(), "fcf_calibration", fcf_ver)
-                except Exception:
-                    fcf_src_dir = None
-
-            from devboard_toolkit.batch_replay import validate_replay_env
-            ok_env, app_name_env = validate_replay_env(
-                replay_dir=unc_replay_folder,
-                need_build=run_build,
-                fcf_src_dir=fcf_src_dir,
-            )
-            if not ok_env:
-                print("[!] 回灌环境完整性检测失败,流水线终止")
-                return 1
-            print(f"  [✓] 环境完整性检测通过, 感知包={'(编译模式,编译产物为准)' if run_build else app_name_env}")
-
-            # 编译模式: 强制刷新一次 Tab3 感知包,确保 _do_start_task 时能拿到编译产物
-            if run_build:
-                print("  [i] 编译模式 → 强制刷新一次 Tab3 感知包下拉框...")
-                try:
-                    import time as _t
-                    retry = 0
-                    while retry < 3:
+                    for fut in as_completed(future_map):
                         if stop.is_set():
-                            return 2
-                        # 在主线程刷新
-                        sync_done = threading.Event()
-                        def _flush():
-                            try:
-                                tab_feed._on_select_env()
-                            finally:
-                                sync_done.set()
-                        self.after(0, _flush)
-                        sync_done.wait(timeout=5)
-                        if tab_feed.pkg_var.get():
+                            cancelled = True
                             break
-                        retry += 1
-                        _t.sleep(2)
-                except Exception as e:
-                    print(f"  [!] 刷新感知包下拉失败: {e}")
+                        tag, _ = future_map[fut]
+                        try:
+                            res = fut.result()
+                        except Exception as e:
+                            print(f"\n[!] {tag} 抛出异常: {e}")
+                            import traceback; traceback.print_exc()
+                            step1_failed = True
+                            continue
+                        if tag == "① 数据处理":
+                            rc_d = res
+                            if rc_d == 2:
+                                print(f"[!] {tag} 已取消")
+                                cancelled = True
+                            elif rc_d != 0:
+                                print(f"[!] {tag} 失败")
+                                step1_failed = True
+                            else:
+                                print(f"[+] {tag} 完成")
+                        else:  # ② 感知包编译
+                            app_name_b, rc_b = res
+                            if rc_b != 0:
+                                print(f"[!] {tag} 失败")
+                                step1_failed = True
+                            else:
+                                print(f"[+] {tag} 完成,感知包名={app_name_b}")
+                                # 编译完成后重新扫描一次 Tab3 感知包下拉
+                                try:
+                                    self.after(0, lambda: tab_feed._on_select_env())
+                                except Exception:
+                                    pass
 
-            # ============================================================
-            # Step 3: 自动回灌 (直接复用 Tab3 的 _do_start_task 全逻辑)
-            # ============================================================
-            print("\n" + "=" * 60)
-            print("  Step 3: 自动回灌")
-            print("=" * 60)
-
-            # 构造 task_ctx (多任务并发模式: 不再设置 self 属性, 改为传 ctx 字典)
-            # 注意: _unc_testbed / _linux_testbed_base 已由 tab3 的
-            #       _on_scan_envs / _on_select_env 设置好
-            f_mode = tab_feed._mode_var.get()
-            f_n = tab_feed.board_count.get()
-            f_user = (tab_feed.sdk_user_var.get()
-                      if f_mode == "sdk"
-                      else tab_feed.list_user_var.get())
-            f_date = (tab_feed.sdk_date_var.get()
-                      if f_mode == "sdk"
-                      else tab_feed.list_date_var.get())
-            f_input_subpath = (tab_feed.sdk_path_var.get()
-                               .replace("\\", "/").strip("/")
-                               if f_mode == "sdk" else "")
-            f_list_input_path = tab_feed.list_txt_row.get() if f_mode == "list" else ""
-            f_list_mode = tab_feed._list_input_mode.get() if hasattr(tab_feed, "_list_input_mode") else "txt"
-            f_env_name = tab_feed.env_var.get()
-
-            task_ctx = {
-                "task_id": "PL",
-                "mode": f_mode,
-                "n": f_n,
-                "user": f_user,
-                "date": f_date,
-                "input_subpath": f_input_subpath,
-                "pkg_name": tab_feed.pkg_var.get(),
-                "car_model": tab_feed.car_var.get(),
-                "fcf_version": tab_feed.cal_var.get(),
-                "replay_folder": f_env_name,
-                "unc_testbed": tab_feed._unc_testbed,
-                "linux_testbed_base": tab_feed._linux_testbed_base,
-                "list_input_mode": f_list_mode,
-                "list_input_path": f_list_input_path,
-                "delete_script": tab_feed.v_delete_scripts.get(),
-            }
-
-            print(f"  [✓] 准备就绪: 方式={f_mode} 板数={f_n} 用户={f_user}")
-
-            rc_feed = tab_feed._do_start_task(task_ctx, stop)
-            if rc_feed == 2:
-                print("[!] 回灌被取消,流水线终止")
-                return 2
-            if rc_feed != 0:
-                print("[!] 自动回灌失败")
-                if "停止" in fail_strategy:
+                if cancelled:
+                    print("\n[!] 用户取消 Step1,流水线终止")
+                    return 2
+                if step1_failed:
+                    print("[!] Step1 有失败节点 → 流水线终止")
                     return 1
             else:
-                print("[+] 自动回灌完成")
+                print("\n[跳过] Step1 (数据处理+感知包编译均未勾选)")
+
+            # ============================================================
+            # Step 2: 回灌环境完整性检测 + 编译后刷新 (仅 n3 勾选时执行)
+            # ============================================================
+            if run_feed:
+                print("\n" + "=" * 60)
+                print(f"  Step 2: 回灌环境完整性检测 (need_build={run_build})")
+                print("=" * 60)
+
+                env_name = tab_feed.env_var.get()
+                unc_testbed = tab_feed._unc_testbed
+                unc_replay_folder = os.path.normpath(os.path.join(unc_testbed, env_name))
+
+                fcf_ver = tab_feed.cal_var.get()
+                fcf_src_dir = None
+                if fcf_ver and fcf_ver != "default":
+                    try:
+                        from devboard_toolkit.batch_replay import _project_tool_dir
+                        fcf_src_dir = os.path.join(
+                            _project_tool_dir(), "fcf_calibration", fcf_ver)
+                    except Exception:
+                        fcf_src_dir = None
+
+                from devboard_toolkit.batch_replay import validate_replay_env
+                ok_env, app_name_env = validate_replay_env(
+                    replay_dir=unc_replay_folder,
+                    need_build=run_build,
+                    fcf_src_dir=fcf_src_dir,
+                )
+                if not ok_env:
+                    print("[!] 回灌环境完整性检测失败,流水线终止")
+                    return 1
+                print(f"  [✓] 环境完整性检测通过, 感知包={'(编译模式,编译产物为准)' if run_build else app_name_env}")
+
+                # 已勾选编译节点: 编译后刷新一次感知包下拉框
+                if run_build:
+                    print("  [i] 编译模式 → 强制刷新一次 Tab3 感知包下拉框...")
+                    try:
+                        import time as _t
+                        retry = 0
+                        while retry < 3:
+                            if stop.is_set():
+                                return 2
+                            sync_done = threading.Event()
+
+                            def _flush():
+                                try:
+                                    tab_feed._on_select_env()
+                                finally:
+                                    sync_done.set()
+
+                            self.after(0, _flush)
+                            sync_done.wait(timeout=5)
+                            if tab_feed.pkg_var.get():
+                                break
+                            retry += 1
+                            _t.sleep(2)
+                    except Exception as e:
+                        print(f"  [!] 刷新感知包下拉失败: {e}")
+            else:
+                print("\n[跳过] Step2 (未勾选自动回灌)")
+
+            # ============================================================
+            # Step 3: 自动回灌 (仅 n3 勾选时执行)
+            # ============================================================
+            if run_feed:
+                print("\n" + "=" * 60)
+                print("  Step 3: 自动回灌")
+                print("=" * 60)
+
+                f_mode = tab_feed._mode_var.get()
+                f_n = tab_feed.board_count.get()
+                f_user = (tab_feed.sdk_user_var.get()
+                          if f_mode == "sdk"
+                          else tab_feed.list_user_var.get())
+                f_date = (tab_feed.sdk_date_var.get()
+                          if f_mode == "sdk"
+                          else tab_feed.list_date_var.get())
+                f_input_subpath = (tab_feed.sdk_path_var.get()
+                                   .replace("\\", "/").strip("/")
+                                   if f_mode == "sdk" else "")
+                f_list_input_path = tab_feed.list_txt_row.get() if f_mode == "list" else ""
+                f_list_mode = tab_feed._list_input_mode.get() if hasattr(tab_feed, "_list_input_mode") else "txt"
+
+                task_ctx = {
+                    "task_id": "PL",
+                    "mode": f_mode,
+                    "n": f_n,
+                    "user": f_user,
+                    "date": f_date,
+                    "input_subpath": f_input_subpath,
+                    "pkg_name": tab_feed.pkg_var.get(),
+                    "car_model": tab_feed.car_var.get(),
+                    "fcf_version": tab_feed.cal_var.get(),
+                    "replay_folder": tab_feed.env_var.get(),
+                    "unc_testbed": tab_feed._unc_testbed,
+                    "linux_testbed_base": tab_feed._linux_testbed_base,
+                    "list_input_mode": f_list_mode,
+                    "list_input_path": f_list_input_path,
+                    "delete_script": tab_feed.v_delete_scripts.get(),
+                }
+
+                print(f"  [✓] 准备就绪: 方式={f_mode} 板数={f_n} 用户={f_user}")
+
+                rc_feed = tab_feed._do_start_task(task_ctx, stop)
+                if rc_feed == 2:
+                    print("[!] 回灌被取消,流水线终止")
+                    return 2
+                if rc_feed != 0:
+                    print("[!] 自动回灌失败 → 流水线终止")
+                    return 1
+                else:
+                    print("[+] 自动回灌完成")
+            else:
+                print("\n[跳过] Step3 自动回灌 (节点未勾选)")
 
             print("\n========== 流水线执行完毕 ==========")
             return 0
+
+        # _step_progress: 将 step_idx(0=Step1/1=Step2/2=Step3) 映射为进度
+        # 分母: 实际执行了多少个执行步(数据/编译并行算1步,环境检测1步,回灌1步)
+        def _build_step_scale():
+            exec_steps = 0
+            if run_data or run_build:
+                exec_steps += 1  # Step1 并行合并为 1 步
+            if run_feed:
+                exec_steps += 2  # Step2 环境检测 + Step3 回灌
+            return max(1, exec_steps)
+
+        steps_total = _build_step_scale()
+
+        def _set_step_progress(step_idx, desc):
+            # step_idx: 0-based, 当前执行到第几个执行步
+            # 每个执行步区间 [step/steps_total, (step+1)/steps_total]
+            # 给个 90% 的最大值(最后收尾再补到 100%)
+            ratio = min(step_idx, steps_total) / steps_total * 0.9
+            pct = int(ratio * 100)
+            self.total_prog.configure(maximum=100, value=pct)
+            self.total_status.set(f"{desc} ({pct}%)")
 
         def _on_done(rc, _a):
             if rc == 0:
@@ -2291,8 +2877,10 @@ class TabPipeline(ttk.Frame):
                 self.log_panel.log("流水线执行失败", "err")
                 self.total_status.set("失败")
 
+        # 初始进度: Step0 参数校验 (起点 5%)
         self.total_prog.configure(maximum=100, value=5)
-        self.total_status.set("运行中… (Step0 参数校验)")
+        self.total_status.set("运行中… (Step0 参数校验, 勾选节点=" +
+                              ",".join(step_nodes) + ")")
         self._thread = _run_in_thread(_task, self.log_panel, self._stop_event, _on_done)
 
     def _on_abort(self):
@@ -2326,6 +2914,31 @@ class _DynKVEditor(ttk.Frame):
 
         self._rows: list = []  # [(key_var, value_var, frame), ...]
 
+        # 可滚动区域
+        scroll_wrap = ttk.Frame(self)
+        scroll_wrap.pack(fill="both", expand=True)
+        self._canvas = tk.Canvas(scroll_wrap, highlightthickness=0, height=220)
+        sb = ttk.Scrollbar(scroll_wrap, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._inner = ttk.Frame(self._canvas)
+        self._canvas_window = self._canvas.create_window(0, 0, window=self._inner, anchor="nw")
+
+        def _on_inner_config(event):
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+            self._canvas.itemconfig(self._canvas_window, width=self._canvas.winfo_width())
+        self._inner.bind("<Configure>", _on_inner_config)
+
+        def _on_canvas_config(event):
+            self._canvas.itemconfig(self._canvas_window, width=event.width)
+        self._canvas.bind("<Configure>", _on_canvas_config)
+
+        def _on_wheel(event):
+            self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._canvas.bind("<MouseWheel>", _on_wheel)
+        self._inner.bind("<MouseWheel>", _on_wheel)
+
         # 底部添加按钮
         foot = ttk.Frame(self)
         foot.pack(fill="x", pady=(6, 0))
@@ -2337,7 +2950,7 @@ class _DynKVEditor(ttk.Frame):
             self.add_row(k, v)
 
     def add_row(self, key: str = "", value: str = ""):
-        row = ttk.Frame(self)
+        row = ttk.Frame(self._inner)
         row.pack(fill="x", pady=2)
         kv = tk.StringVar(value=key)
         vv = tk.StringVar(value=value)
@@ -2381,6 +2994,31 @@ class _BoardEditor(ttk.Frame):
 
         self._rows: list = []
 
+        # 可滚动区域
+        scroll_wrap = ttk.Frame(self)
+        scroll_wrap.pack(fill="both", expand=True)
+        self._canvas = tk.Canvas(scroll_wrap, highlightthickness=0, height=220)
+        sb = ttk.Scrollbar(scroll_wrap, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._inner = ttk.Frame(self._canvas)
+        self._canvas_window = self._canvas.create_window(0, 0, window=self._inner, anchor="nw")
+
+        def _on_inner_config(event):
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+            self._canvas.itemconfig(self._canvas_window, width=self._canvas.winfo_width())
+        self._inner.bind("<Configure>", _on_inner_config)
+
+        def _on_canvas_config(event):
+            self._canvas.itemconfig(self._canvas_window, width=event.width)
+        self._canvas.bind("<Configure>", _on_canvas_config)
+
+        def _on_wheel(event):
+            self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._canvas.bind("<MouseWheel>", _on_wheel)
+        self._inner.bind("<MouseWheel>", _on_wheel)
+
         foot = ttk.Frame(self)
         foot.pack(fill="x", pady=(6, 0))
         ttk.Button(foot, text="+ 添加开发板", style="Ghost.TButton",
@@ -2395,7 +3033,7 @@ class _BoardEditor(ttk.Frame):
 
     def add_row(self, name: str = "", ip: str = "", port: str = "22",
                 user: str = "root", timeout: str = "8"):
-        row = ttk.Frame(self)
+        row = ttk.Frame(self._inner)
         row.pack(fill="x", pady=2)
         nv, iv, pv, uv, tv = (tk.StringVar(value=name), tk.StringVar(value=ip),
                               tk.StringVar(value=port), tk.StringVar(value=user),
@@ -2437,7 +3075,7 @@ class _BoardEditor(ttk.Frame):
 # ---------------------------------------------------------------------------
 
 # 项目根目录的 config.yaml 路径
-_CONFIG_YAML_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
+_CONFIG_YAML_PATH = os.path.join(_PROJECT_ROOT, "config.yaml")
 
 # 开发板共享密码(硬编码)
 _BOARD_PASSWORD = "arcsoft123"

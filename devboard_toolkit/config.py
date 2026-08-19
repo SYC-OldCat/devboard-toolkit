@@ -8,6 +8,8 @@
 """
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Dict, Any
 
@@ -104,9 +106,20 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def get_project_root() -> str:
+    """获取项目根目录
+
+    exe 打包后: 返回 exe 所在目录 (config.yaml / tool/ 在 exe 旁边)
+    开发模式: 返回 devboard_toolkit 包的上级目录
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _yaml_path() -> Path:
     """config.yaml 搜索路径:项目目录"""
-    return Path.cwd() / "config.yaml"
+    return Path(get_project_root()) / "config.yaml"
 
 
 def load_boards() -> Dict[str, Dict[str, Any]]:
