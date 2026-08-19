@@ -815,7 +815,7 @@ class TabFeedback(ttk.Frame):
         self.sdk_path_var = tk.StringVar()
         ttk.Entry(row_sdk_path, textvariable=self.sdk_path_var, width=30).pack(
             side="left", fill="x", expand=True)
-        ttk.Label(row_sdk_path, text="例: 20260810/0452",
+        ttk.Label(row_sdk_path, text="例: 20260810/0452 或 20260810\\0452",
                   style="Hint.TLabel").pack(side="left", padx=(8, 0))
 
         # 视频路径 (智能检测: 已预处理 → 列表回灌, 未预处理 → 复制+预处理+SDK回灌)
@@ -2803,7 +2803,7 @@ class TabPipeline(ttk.Frame):
                 f_date = (tab_feed.sdk_date_var.get()
                           if f_mode == "sdk"
                           else tab_feed.list_date_var.get())
-                f_input_subpath = (tab_feed.sdk_path_var.get()
+                f_input_subpath = (tab_feed.sdk_path_var.get().strip()
                                    .replace("\\", "/").strip("/")
                                    if f_mode == "sdk" else "")
                 f_list_input_path = tab_feed.list_txt_row.get() if f_mode == "list" else ""

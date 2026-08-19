@@ -518,6 +518,11 @@ def _extract_runtime(sdk_zip_path: str, dest_dir: str) -> str:
 
             # 复制 runtime 下所有文件到 dest_dir/runtime/
             runtime_dest = os.path.join(dest_dir, "runtime")
+            # 如果已存在旧 runtime,先删除再复制,确保干净覆盖
+            if os.path.exists(runtime_dest):
+                shutil.rmtree(runtime_dest, ignore_errors=True)
+                print(f"  [i] 已删除旧 runtime 目录: {runtime_dest}")
+            os.makedirs(runtime_dest, exist_ok=True)
             count = 0
             for name in names:
                 if not name.startswith(found_prefix):

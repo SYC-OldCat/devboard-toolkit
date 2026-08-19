@@ -42,8 +42,9 @@ def normalize_path(p: str) -> str:
 
 # ============================================================
 # 车型关键词 (路径中包含 key 即归为 car, 先排 long key → short key, 防止短词抢命中)
+# 从 config.yaml 的 car_keywords 加载, 硬编码作为 fallback
 # ============================================================
-CAR_KEYWORDS_RAW: Dict[str, str] = {
+_DEFAULT_CAR_KEYWORDS: Dict[str, str] = {
     "lixiang3": "lixiang3", "lixiang2": "lixiang2", "lixiang1": "lixiang1",
     "lx3": "lixiang3", "lx2": "lixiang2", "lx1": "lixiang1",
     "lixinag1": "lixiang1", "lixinag2": "lixiang2",
@@ -71,7 +72,39 @@ CAR_KEYWORDS_RAW: Dict[str, str] = {
     "gl8": "GL8", "GL8": "gl8",
     "hq": "HQ", "hongqi": "HQ",
     "bl": "BL", "BL": "BL",
+
+    "2239": "geely_2239",
+    "2506": "geely_2506",
+    "0452": "geely_0452", "463": "geely_463",
+    "0463": "geely_0463", "508": "geely_508",
+    "1604": "geely_1604", "0508": "geely_0508",
+    "5463": "geely_5463", "3637": "geely_3637",
 }
+
+
+def _load_car_keywords() -> Dict[str, str]:
+    """从 config.yaml 加载 car_keywords, 加载失败则用默认值"""
+    import sys, os
+    try:
+        # 适配 exe 环境: 找 config.yaml
+        if getattr(sys, 'frozen', False):
+            root = os.path.dirname(sys.executable)
+        else:
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cfg_path = os.path.join(root, "config.yaml")
+        if os.path.isfile(cfg_path):
+            import yaml
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            kw = data.get("car_keywords")
+            if isinstance(kw, dict) and kw:
+                return {str(k): str(v) for k, v in kw.items()}
+    except Exception:
+        pass
+    return _DEFAULT_CAR_KEYWORDS
+
+
+CAR_KEYWORDS_RAW: Dict[str, str] = _load_car_keywords()
 
 # 按 key 长度从长到短排序 (防止短词抢命中)
 CAR_KEYWORDS: List[Tuple[str, str]] = sorted(
