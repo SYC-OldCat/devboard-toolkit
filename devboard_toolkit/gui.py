@@ -3813,24 +3813,33 @@ class App(tk.Tk):
         version_path = os.path.join(exe_dir, "_version.txt")
         current_pid = os.getpid()
         bat_path = os.path.join(tempfile.gettempdir(), "devboard_updater.bat")
+        log_path = os.path.join(tempfile.gettempdir(), "devboard_updater.log")
 
         bat_lines = [
             "@echo off",
             "chcp 65001 >nul",
-            "echo 正在更新 DevBoard Toolkit...",
-            "echo.",
+            f'echo [{time.strftime("%H:%M:%S")}] 开始更新 > "{log_path}"',
+            f'echo 目标: {target_path} >> "{log_path}"',
+            f'echo 新文件: {new_exe} >> "{log_path}"',
+            "echo. >> " + '"' + log_path + '"',
             "",
             ":wait",
             f'tasklist /FI "PID eq {current_pid}" 2>nul | find "{current_pid}" >nul',
             "if %ERRORLEVEL%==0 (",
+            f'    echo 等待进程 {current_pid} 退出... >> "{log_path}"',
             "    timeout /t 1 >nul",
             "    goto wait",
             ")",
+            f'echo 进程 {current_pid} 已退出 >> "{log_path}"',
             "",
-            "echo 正在替换文件...",
-            f'copy /Y "{new_exe}" "{target_path}"',
+            # 等待文件句柄释放
+            "timeout /t 2 >nul",
+            "",
+            f'echo 正在替换文件... >> "{log_path}"',
+            f'copy /Y "{new_exe}" "{target_path}" >> "{log_path}" 2>&1',
             "if %ERRORLEVEL% neq 0 (",
-            f'    echo 替换失败！请手动将 {new_exe} 复制到 {target_path}',
+            f'    echo [FAIL] 替换失败, 错误码=%ERRORLEVEL% >> "{log_path}"',
+            f'    echo 请手动将 {new_exe} 复制到 {target_path} >> "{log_path}"',
             "    pause",
             f'    del "{bat_path}"',
             "    exit /b 1",
@@ -3841,7 +3850,7 @@ class App(tk.Tk):
         # 如果有 _version.txt, 也覆盖
         if new_ver:
             bat_lines.extend([
-                f'copy /Y "{new_ver}" "{version_path}"',
+                f'copy /Y "{new_ver}" "{version_path}" >> "{log_path}" 2>&1',
                 f'del "{new_ver}" 2>nul',
             ])
         else:
@@ -3849,7 +3858,7 @@ class App(tk.Tk):
             bat_lines.append(f'echo {new_hash}> "{version_path}"')
 
         bat_lines.extend([
-            "echo 更新完成，正在重启...",
+            f'echo 更新完成 >> "{log_path}"',
             f'start "" "{target_path}"',
             f'del "{bat_path}"',
         ])
@@ -3859,17 +3868,28 @@ class App(tk.Tk):
         try:
             with open(bat_path, "w", encoding="gbk") as f:
                 f.write(bat_content)
+            # 验证 bat 文件已创建
+            if not os.path.isfile(bat_path):
+                raise RuntimeError(".bat 文件创建失败")
         except Exception as e:
             messagebox.showerror("更新失败", f"无法创建更新脚本:\n{e}")
             return
 
-        # 启动 .bat → 退出当前 exe
+        # 记录日志文件路径, 方便用户排查
+        log_msg = f"更新日志: {log_path}"
+
+        # 启动 .bat → 延迟 1s 再退出, 确保 bat 已被系统加载
         import subprocess
         subprocess.Popen(
             ["cmd", "/c", bat_path],
-            creationflags=subprocess.CREATE_NO_WINDOW
+            cwd=tempfile.gettempdir(),
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True,
         )
-        self.quit()
+
+        # 不立即退出, 等 1s 让 bat 脚本的 wait 循环先启动
+        # 这样即使文件句柄没立刻释放, bat 也在持续等待
+        self.after(500, self.quit)
 
     def _open_settings(self):
         SettingsDialog(self, on_save=self._save_settings, config_path=_CONFIG_YAML_PATH)
