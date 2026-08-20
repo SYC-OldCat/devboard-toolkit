@@ -3811,7 +3811,7 @@ class App(tk.Tk):
 
     def _swap_and_restart(self, new_exe: str, new_ver: str,
                           new_hash: str, dl_win):
-        """生成 .bat 脚本: 等待当前 exe 退出 → 覆盖 → 更新 _version.txt → 重启"""
+        """生成 .bat 脚本: 等待退出→替换→重启 (explorer 等同双击, 最可靠)"""
         import tempfile
 
         dl_win.destroy()
@@ -3824,16 +3824,14 @@ class App(tk.Tk):
         bat_path = os.path.join(tempfile.gettempdir(), "devboard_updater.bat")
         log_path = os.path.join(tempfile.gettempdir(), "devboard_updater.log")
 
-        # 改用 VBScript 来启动 bat (更可靠, 不显示黑框)
-        vbs_path = os.path.join(tempfile.gettempdir(), "devboard_updater.vbs")
-
+        # 关键: 用 explorer 启动新 exe (等同双击, 绕过 start 的各种坑)
+        # explorer 会用 Windows Shell 打开 .exe, 100% 可靠
+        safe_log = log_path.replace('\\', '\\\\')
         bat_lines = [
             "@echo off",
-            "chcp 65001 >nul",
-            f'echo [{time.strftime("%H:%M:%S")}] 开始更新 > "{log_path}"',
+            f'echo [{time.strftime("%H:%M:%S")}] 开始更新 > "{safe_log}"',
             f'echo 目标: {target_path} >> "{log_path}"',
             f'echo 新文件: {new_exe} >> "{log_path}"',
-            "echo. >> " + '"' + log_path + '"',
             "",
             ":wait",
             f'tasklist /FI "PID eq {current_pid}" 2>nul | find "{current_pid}" >nul',
@@ -3842,38 +3840,31 @@ class App(tk.Tk):
             "    timeout /t 1 >nul",
             "    goto wait",
             ")",
-            f'echo 进程 {current_pid} 已退出 >> "{log_path}"',
             "",
-            # 等待文件句柄释放
             "timeout /t 2 >nul",
             "",
-            f'echo 正在替换文件... >> "{log_path}"',
+            f'echo 正在替换... >> "{log_path}"',
             f'copy /Y "{new_exe}" "{target_path}" >> "{log_path}" 2>&1',
             "if %ERRORLEVEL% neq 0 (",
-            f'    echo [FAIL] 替换失败, 错误码=%ERRORLEVEL% >> "{log_path}"',
-            f'    echo 请手动将 {new_exe} 复制到 {target_path} >> "{log_path}"',
+            f'    echo [FAIL] 替换失败 >> "{log_path}"',
             "    pause",
-            f'    del "{bat_path}"',
             "    exit /b 1",
             ")",
             f'del "{new_exe}" 2>nul',
         ]
 
-        # 如果有 _version.txt, 也覆盖
         if new_ver:
             bat_lines.extend([
                 f'copy /Y "{new_ver}" "{version_path}" >> "{log_path}" 2>&1',
                 f'del "{new_ver}" 2>nul',
             ])
         else:
-            # 没有独立 _version.txt → 直接写 hash
             bat_lines.append(f'echo {new_hash}> "{version_path}"')
 
         bat_lines.extend([
-            f'echo [{time.strftime("%H:%M:%S")}] 更新完成 >> "{log_path}"',
-            f'echo 正在重启... >> "{log_path}"',
-            # 用 start /b + timeout 确保进程启动
-            f'start "" /B "{target_path}"',
+            f'echo 更新完成 >> "{log_path}"',
+            # 用 explorer 启动 (等同双击文件, 最可靠)
+            f'explorer "{target_path}"',
             f'timeout /t 1 >nul',
             f'del "{bat_path}"',
         ])
@@ -3889,36 +3880,17 @@ class App(tk.Tk):
             messagebox.showerror("更新失败", f"无法创建更新脚本:\n{e}")
             return
 
-        # 用 VBScript 静默启动 bat (不显示黑框, 更可靠)
-        vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """{bat_path}""", 0, False
-'''
-        try:
-            with open(vbs_path, "w", encoding="utf-8") as f:
-                f.write(vbs_content)
-        except Exception:
-            pass
-
-        # 启动 VBS 或直接用 cmd
+        # 用 cmd /c 启动 bat (最简方式)
         import subprocess
-        if os.path.isfile(vbs_path):
-            # 优先用 VBS (静默)
-            subprocess.Popen(
-                ["wscript.exe", vbs_path],
-                cwd=tempfile.gettempdir(),
-                close_fds=True,
-            )
-        else:
-            # 回退: 用 cmd (显示黑框但可靠)
-            subprocess.Popen(
-                ["cmd", "/c", bat_path],
-                cwd=tempfile.gettempdir(),
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                close_fds=True,
-            )
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            cwd=tempfile.gettempdir(),
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True,
+        )
 
-        # 延迟退出, 确保脚本已启动
-        self.after(500, self.quit)
+        # 延迟退出, 确保 bat 已启动并进入 wait 循环
+        self.after(800, self.quit)
 
     def _open_settings(self):
         SettingsDialog(self, on_save=self._save_settings, config_path=_CONFIG_YAML_PATH)
