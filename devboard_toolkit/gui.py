@@ -3633,7 +3633,7 @@ class App(tk.Tk):
             return ""
 
     def _check_update(self):
-        """后台检测 GitHub 是否有新版本 (使用 raw.githubusercontent.com 避免 API 限流)"""
+        """后台检测 GitHub Releases 是否有新版本"""
         print("[更新] 启动版本检测...", flush=True)
         local_hash = self._read_local_version()
         print(f"[更新] 本地版本: {local_hash or '(无)'}", flush=True)
@@ -3643,25 +3643,26 @@ class App(tk.Tk):
             return
 
         def _worker():
+            import json as _json
             import urllib.request
             import urllib.error
 
-            # 方式1: 直接拉取仓库根目录的 _version.txt (无频率限制)
-            raw_url = (f"https://raw.githubusercontent.com/{self._GH_OWNER}/"
-                      f"{self._GH_REPO}/{self._GH_BRANCH}/_version.txt")
-            print(f"[更新] 请求: {raw_url}", flush=True)
+            # 使用 Releases API (1次请求同时获取版本号和下载信息)
+            releases_url = (f"https://api.github.com/repos/{self._GH_OWNER}/"
+                           f"{self._GH_REPO}/releases/latest")
+            print(f"[更新] 请求: {releases_url}", flush=True)
 
-            remote_hash = ""
             try:
-                req = urllib.request.Request(raw_url, headers={
+                req = urllib.request.Request(releases_url, headers={
                     "User-Agent": "devboard-toolkit-updater",
+                    "Accept": "application/vnd.github+json",
                 })
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    remote_hash = resp.read().decode("utf-8").strip()
-                print(f"[更新] 远程版本: {remote_hash or '(无)'}", flush=True)
+                    rel_data = _json.loads(resp.read().decode("utf-8"))
+                print("[更新] Release API 请求成功", flush=True)
             except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    print("[更新] 仓库根目录无 _version.txt, 跳过", flush=True)
+                if e.code == 403 and "rate limit" in str(e).lower():
+                    print("[更新] GitHub API 限流, 稍后再试", flush=True)
                 else:
                     print(f"[更新] 请求失败 (HTTP {e.code})", flush=True)
                 return
@@ -3669,20 +3670,34 @@ class App(tk.Tk):
                 print(f"[更新] 请求失败: {e}", flush=True)
                 return
 
+            # 从 Release tag_name 提取版本号
+            tag = rel_data.get("tag_name", "")
+            remote_hash = ""
+            if tag.startswith("v"):
+                # tag 格式: v20260820_0952_3a1d97f5 → 取最后一段作为 hash
+                parts = tag.split("_")
+                if len(parts) >= 3:
+                    remote_hash = parts[-1]
+                else:
+                    remote_hash = tag[1:]  # fallback: 去 v 前缀
+            else:
+                remote_hash = tag
+
+            print(f"[更新] 远程版本: {remote_hash or '(无)'} (tag: {tag})", flush=True)
             if not remote_hash:
-                print("[更新] 远程 hash 为空, 跳过", flush=True)
+                print("[更新] 无远程版本, 跳过", flush=True)
                 return
 
-            # 比较 (取前 12 位)
-            if local_hash[:12] == remote_hash[:12]:
-                print("[更新] 已是最新版本", flush=True)
+            # 比较: local_hash 前 8 位 == remote_hash (tag 中的短 hash)
+            if local_hash[:8] == remote_hash[:8]:
+                print("[更新] 已是最新版本")
                 return
 
-            print(f"[更新] 发现新版本! 本地={local_hash[:12]} 远程={remote_hash[:12]}", flush=True)
+            print(f"[更新] 发现新版本! 本地={local_hash[:8]} 远程={remote_hash[:8]}", flush=True)
 
-            # 有更新 → 主线程弹窗确认
-            # commit_msg 从 hash 解析: 取前 7 位显示
-            commit_msg = f"版本 {remote_hash[:7]}"
+            # 从 release body 提取更新说明
+            body = rel_data.get("body", "") or ""
+            commit_msg = body.split("\n")[0][:60] if body else f"版本 {remote_hash[:7]}"
 
             self.after(0, lambda: self._prompt_update(
                 remote_hash, commit_msg))
@@ -3692,8 +3707,8 @@ class App(tk.Tk):
     def _prompt_update(self, remote_hash: str, commit_msg: str):
         """弹窗提示用户是否更新"""
         msg = (f"发现新版本\n\n"
-               f"当前版本: {self._read_local_version()[:12]}\n"
-               f"最新版本: {remote_hash}\n"
+               f"当前版本: {self._read_local_version()[:8]}\n"
+               f"最新版本: {remote_hash[:8]}\n"
                f"更新内容: {commit_msg}\n\n"
                f"是否立即下载并更新？")
         rc = messagebox.askyesno("自动更新", msg, default="yes")
