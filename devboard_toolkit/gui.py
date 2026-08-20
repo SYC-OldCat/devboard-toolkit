@@ -3633,7 +3633,7 @@ class App(tk.Tk):
             return ""
 
     def _check_update(self):
-        """后台检测 GitHub Releases 是否有新版本"""
+        """后台检测 GitHub Releases Atom Feed (无API限流)"""
         print("[更新] 启动版本检测...", flush=True)
         local_hash = self._read_local_version()
         print(f"[更新] 本地版本: {local_hash or '(无)'}", flush=True)
@@ -3643,43 +3643,44 @@ class App(tk.Tk):
             return
 
         def _worker():
-            import json as _json
+            import re
             import urllib.request
             import urllib.error
 
-            # 使用 Releases API (1次请求同时获取版本号和下载信息)
-            releases_url = (f"https://api.github.com/repos/{self._GH_OWNER}/"
-                           f"{self._GH_REPO}/releases/latest")
-            print(f"[更新] 请求: {releases_url}", flush=True)
+            # 使用 Releases Atom Feed (无频率限制, 不占 API 配额)
+            atom_url = (f"https://github.com/{self._GH_OWNER}/"
+                       f"{self._GH_REPO}/releases.atom")
+            print(f"[更新] 请求: {atom_url}", flush=True)
 
             try:
-                req = urllib.request.Request(releases_url, headers={
+                req = urllib.request.Request(atom_url, headers={
                     "User-Agent": "devboard-toolkit-updater",
-                    "Accept": "application/vnd.github+json",
                 })
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    rel_data = _json.loads(resp.read().decode("utf-8"))
-                print("[更新] Release API 请求成功", flush=True)
-            except urllib.error.HTTPError as e:
-                if e.code == 403 and "rate limit" in str(e).lower():
-                    print("[更新] GitHub API 限流, 稍后再试", flush=True)
-                else:
-                    print(f"[更新] 请求失败 (HTTP {e.code})", flush=True)
-                return
+                    atom_xml = resp.read().decode("utf-8")
+                print("[更新] Atom Feed 请求成功", flush=True)
             except Exception as e:
                 print(f"[更新] 请求失败: {e}", flush=True)
                 return
 
-            # 从 Release tag_name 提取版本号
-            tag = rel_data.get("tag_name", "")
+            # 从 Atom Feed 的第一个 <link rel="alternate"> 提取 tag
+            # 格式: href=".../releases/tag/v20260820_0957_98453732"
+            tag = ""
+            m = re.search(r'href="[^"]*/releases/tag/([^"]+)"', atom_xml)
+            if m:
+                tag = m.group(1).strip()
+
+            # 有时 title 包含 HTML 标签, 清理
+            tag = re.sub(r"<[^>]+>", "", tag).strip()
+
             remote_hash = ""
             if tag.startswith("v"):
-                # tag 格式: v20260820_0952_3a1d97f5 → 取最后一段作为 hash
+                # tag 格式: v20260820_0957_98453732 → 取最后一段
                 parts = tag.split("_")
                 if len(parts) >= 3:
                     remote_hash = parts[-1]
                 else:
-                    remote_hash = tag[1:]  # fallback: 去 v 前缀
+                    remote_hash = tag[1:]
             else:
                 remote_hash = tag
 
@@ -3688,23 +3689,30 @@ class App(tk.Tk):
                 print("[更新] 无远程版本, 跳过", flush=True)
                 return
 
-            # 比较: local_hash 前 8 位 == remote_hash (tag 中的短 hash)
+            # 比较: local_hash 前 8 位 == remote_hash
             if local_hash[:8] == remote_hash[:8]:
-                print("[更新] 已是最新版本")
+                print("[更新] 已是最新版本", flush=True)
                 return
 
             print(f"[更新] 发现新版本! 本地={local_hash[:8]} 远程={remote_hash[:8]}", flush=True)
 
-            # 从 release body 提取更新说明
-            body = rel_data.get("body", "") or ""
-            commit_msg = body.split("\n")[0][:60] if body else f"版本 {remote_hash[:7]}"
+            # 更新说明: 从 Atom content 提取
+            commit_msg = f"版本 {remote_hash[:7]}"
+            # 尝试提取第一个 release body 文本
+            content_m = re.search(
+                r"<content[^>]*>(.*?)</content>", atom_xml, re.DOTALL)
+            if content_m:
+                body = re.sub(r"<[^>]+>", "", content_m.group(1)).strip()
+                if body:
+                    commit_msg = body.split("\n")[0][:60] or commit_msg
 
             self.after(0, lambda: self._prompt_update(
-                remote_hash, commit_msg))
+                remote_hash, commit_msg, tag))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _prompt_update(self, remote_hash: str, commit_msg: str):
+    def _prompt_update(self, remote_hash: str, commit_msg: str,
+                       release_tag: str = ""):
         """弹窗提示用户是否更新"""
         msg = (f"发现新版本\n\n"
                f"当前版本: {self._read_local_version()[:8]}\n"
@@ -3713,45 +3721,22 @@ class App(tk.Tk):
                f"是否立即下载并更新？")
         rc = messagebox.askyesno("自动更新", msg, default="yes")
         if rc:
-            self._do_update(remote_hash)
+            self._do_update(remote_hash, release_tag)
 
-    def _do_update(self, remote_hash: str):
+    def _do_update(self, remote_hash: str, release_tag: str = ""):
         """下载新 exe + _version.txt + 写 .bat 替换脚本 + 重启"""
-        import json as _json
         import urllib.request
         import urllib.error
         import tempfile
 
-        # 1. 获取最新 Release 的 asset download URL
-        releases_url = (f"https://api.github.com/repos/{self._GH_OWNER}/"
-                        f"{self._GH_REPO}/releases/latest")
+        # 如果没有传 tag, 从 remote_hash 推导 (格式: v20260820_HHmm_hash)
+        if not release_tag:
+            release_tag = f"v_auto_{remote_hash[:8]}"
 
-        try:
-            req = urllib.request.Request(releases_url, headers={
-                "User-Agent": "devboard-toolkit-updater",
-                "Accept": "application/vnd.github+json",
-            })
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                rel_data = _json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            messagebox.showerror("更新失败", f"无法获取 Release 信息:\n{e}")
-            return
-
-        # 从 Release assets 中提取 exe 和 _version.txt 的下载地址
-        exe_url = None
-        ver_url = None
-        release_tag = rel_data.get("tag_name", remote_hash)
-        for asset in rel_data.get("assets", []):
-            name = asset.get("name", "").lower()
-            if name == self._EXE_NAME.lower():
-                exe_url = asset.get("browser_download_url")
-            elif name == "_version.txt":
-                ver_url = asset.get("browser_download_url")
-
-        if not exe_url:
-            messagebox.showerror("更新失败",
-                                f"Release {release_tag} 中未找到 {self._EXE_NAME}")
-            return
+        # 用 tag 直接构造下载 URL (无需 API, 无频率限制)
+        base_dl = f"https://github.com/{self._GH_OWNER}/{self._GH_REPO}/releases/download/{release_tag}"
+        exe_url = f"{base_dl}/{self._EXE_NAME}"
+        ver_url = f"{base_dl}/_version.txt"
 
         # 2. 弹出下载进度窗口
         dl_win = tk.Toplevel(self)
