@@ -3584,7 +3584,7 @@ class App(tk.Tk):
         header.pack(fill="x", padx=16, pady=(12, 0))
         ttk.Label(header, text="🛠️  DevBoard Toolkit",
                   style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="  v0.1.0  ·  数据处理 + 感知包编译 + 自动回灌",
+        ttk.Label(header, text="  v0.2.0  ·  数据处理 + 感知包编译 + 自动回灌 + 自动更新",
                   style="Hint.TLabel").pack(side="left", pady=(6, 0))
         ttk.Button(header, text="⚙ 设置", style="Ghost.TButton",
                    command=self._open_settings).pack(side="right")
