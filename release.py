@@ -105,8 +105,8 @@ def _build_exe():
 
 
 def _write_version_file(git_hash):
-    """写 _version.txt 到 dist/"""
-    print(f"\n[3] 注入版本号: {git_hash}")
+    """写 _version.txt 到 dist/ (随 exe 分发)"""
+    print(f"  [+] 注入版本号: {git_hash}")
     ver_path = os.path.join(_DIST_DIR, _VERSION_FILE)
     with open(ver_path, "w", encoding="utf-8") as f:
         f.write(git_hash)
@@ -210,18 +210,31 @@ def main():
         print(f"  版本号: {git_hash}")
         return 0
 
-    # 1. git 提交推送
+    # 1. 获取 git hash + 写入 _version.txt (仓库根目录, 供 raw.githubusercontent.com 拉取)
+    print("\n[1] 获取版本信息...")
+    git_hash = _get_git_hash()
+    branch = _get_git_branch()
+    print(f"  commit: {git_hash}")
+    print(f"  branch: {branch}")
+
+    # 先写仓库根目录的 _version.txt → 确保 git push 后 raw.githubusercontent.com 能拉到
+    root_ver_path = os.path.join(_PROJECT_ROOT, _VERSION_FILE)
+    with open(root_ver_path, "w", encoding="utf-8") as f:
+        f.write(git_hash)
+    print(f"  [+] 写入仓库根目录: {root_ver_path}")
+
+    # git commit + push (包含 _version.txt)
     if args.skip_git:
-        print("\n[1] 跳过 git 提交推送 (--skip-git)")
+        print("\n[2] 跳过 git 提交推送 (--skip-git)")
     else:
-        print("\n[1] git 提交推送...")
+        print("\n[2] git 提交推送...")
         ok = _git_commit_push(commit_msg=args.message)
         if not ok:
             print("[!] git push 失败, 流程终止")
             return 1
 
-    # 2. 获取 git 信息
-    print("\n[2] 获取版本信息...")
+    # 2. 获取 git 信息 (重新获取, 确保 hash 一致)
+    print("\n[3] 获取版本信息...")
     git_hash = _get_git_hash()
     branch = _get_git_branch()
     print(f"  commit: {git_hash}")
@@ -231,9 +244,9 @@ def main():
     if not args.skip_build:
         _build_exe()
     else:
-        print("\n[3] 跳过打包 (--skip-build)")
+        print("\n[4] 跳过打包 (--skip-build)")
 
-    # 4. 注入版本号
+    # 4. 注入版本号 (dist/)
     _write_version_file(git_hash)
 
     # 5. 发布

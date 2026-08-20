@@ -3633,45 +3633,47 @@ class App(tk.Tk):
             return ""
 
     def _check_update(self):
-        """后台检测 GitHub 是否有新版本"""
+        """后台检测 GitHub 是否有新版本 (使用 raw.githubusercontent.com 避免 API 限流)"""
         print("[更新] 启动版本检测...", flush=True)
         local_hash = self._read_local_version()
         print(f"[更新] 本地版本: {local_hash or '(无)'}", flush=True)
         
         if not local_hash:
-            # 无版本文件 → 开发模式或首次运行, 跳过
             print("[更新] 无 _version.txt, 跳过检测", flush=True)
             return
 
         def _worker():
-            import json as _json
             import urllib.request
             import urllib.error
 
-            api_url = (f"https://api.github.com/repos/{self._GH_OWNER}/"
-                       f"{self._GH_REPO}/commits/{self._GH_BRANCH}")
-            print(f"[更新] 请求: {api_url}", flush=True)
+            # 方式1: 直接拉取仓库根目录的 _version.txt (无频率限制)
+            raw_url = (f"https://raw.githubusercontent.com/{self._GH_OWNER}/"
+                      f"{self._GH_REPO}/{self._GH_BRANCH}/_version.txt")
+            print(f"[更新] 请求: {raw_url}", flush=True)
 
+            remote_hash = ""
             try:
-                req = urllib.request.Request(api_url, headers={
+                req = urllib.request.Request(raw_url, headers={
                     "User-Agent": "devboard-toolkit-updater",
-                    "Accept": "application/vnd.github+json",
                 })
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = _json.loads(resp.read().decode("utf-8"))
-                print("[更新] API 请求成功", flush=True)
+                    remote_hash = resp.read().decode("utf-8").strip()
+                print(f"[更新] 远程版本: {remote_hash or '(无)'}", flush=True)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    print("[更新] 仓库根目录无 _version.txt, 跳过", flush=True)
+                else:
+                    print(f"[更新] 请求失败 (HTTP {e.code})", flush=True)
+                return
             except Exception as e:
-                print(f"[更新] API 请求失败: {e}", flush=True)
-                # 网络不通 / API 不可达 → 静默跳过
+                print(f"[更新] 请求失败: {e}", flush=True)
                 return
 
-            remote_hash = (data.get("sha") or "")[:12]
-            print(f"[更新] 远程版本: {remote_hash or '(无)'}", flush=True)
             if not remote_hash:
-                print("[更新] 无远程 hash, 跳过", flush=True)
+                print("[更新] 远程 hash 为空, 跳过", flush=True)
                 return
 
-            # 比较前 12 位 (GitHub short hash)
+            # 比较 (取前 12 位)
             if local_hash[:12] == remote_hash[:12]:
                 print("[更新] 已是最新版本", flush=True)
                 return
@@ -3679,12 +3681,8 @@ class App(tk.Tk):
             print(f"[更新] 发现新版本! 本地={local_hash[:12]} 远程={remote_hash[:12]}", flush=True)
 
             # 有更新 → 主线程弹窗确认
-            commit_msg = ""
-            try:
-                commit_msg = data.get("commit", {}).get(
-                    "message", "").split("\n")[0][:60]
-            except Exception:
-                pass
+            # commit_msg 从 hash 解析: 取前 7 位显示
+            commit_msg = f"版本 {remote_hash[:7]}"
 
             self.after(0, lambda: self._prompt_update(
                 remote_hash, commit_msg))
