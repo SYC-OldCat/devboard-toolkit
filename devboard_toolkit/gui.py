@@ -1327,6 +1327,7 @@ class TabFeedback(ttk.Frame):
             "list_input_mode": list_mode_val,
             "list_input_path": list_input_path,
             "delete_script": self.v_delete_scripts.get(),
+            "procs": [],  # 跟踪所有启动的终端进程, 用于取消时 kill
         }
 
         # 仅第一个任务时清空日志面板 (后续任务追加输出)
@@ -1699,12 +1700,12 @@ class TabFeedback(ttk.Frame):
                         print(f"    待-{j}. {Path(sp).name:<32s} ← {sf} ({lc:3d} 条)")
 
                 from devboard_toolkit.batch_replay import _launch_terminals
-                _launch_terminals(
+                ctx["procs"].extend(_launch_terminals(
                     _PROJECT_ROOT, assignments,
                     log_dir=log_dir, app_suffix=suffix,
                     delete_script=delete_script,
                     no_reboot_boards=no_reboot_set,
-                )
+                ))
                 print(f"\n[+] 已启动回灌 (txt={os.path.basename(txt_path)}, "
                       f"首批板: {', '.join(actual_boards)}, 待接力: {len(pending_parts)} 份)")
 
@@ -1866,14 +1867,14 @@ class TabFeedback(ttk.Frame):
                     print(f"\n[接力] {board_name} 续跑 {os.path.basename(txt_path)} → "
                           f"{script_name} ← {sub_file} ({line_cnt} 条) [reboot]")
                     from devboard_toolkit.batch_replay import _launch_terminals
-                    _launch_terminals(
+                    ctx["procs"].extend(_launch_terminals(
                         _PROJECT_ROOT,
                         [(board_name, info["replay_folder"], script_name)],
                         log_dir=info["log_dir"],
                         app_suffix=info["suffix"],
                         delete_script=info["delete_script"],
                         no_reboot_boards=set(),  # 不跳过 reboot
-                    )
+                    ))
                     # 板重新加入该 txt 的在跑列表
                     info["boards"].append(board_name)
 
@@ -2198,17 +2199,12 @@ class TabFeedback(ttk.Frame):
                                 pass
 
                     from devboard_toolkit.batch_replay import _launch_terminals
-                    _launch_terminals(
+                    ctx["procs"].extend(_launch_terminals(
                         _PROJECT_ROOT, assignments,
                         log_dir=log_dir, app_suffix=suffix,
                         delete_script=delete_script,
-                    )
+                    ))
                     print(f"\n  [+] SDK 回灌已启动 ({len(board_names)} 块板)")
-                    # 等待 Step1 SDK 回灌完成再进 Step2 (避免板状态混乱)
-                    ok = self._wait_all_boards_done(board_names, log_dir, stop_event)
-                    self._pool_return_batch(board_names)
-                    if not ok:
-                        return 2
 
                 # === Step 2: 已预处理分支 (classify_by_car 生成 txt → 列表回灌) ===
                 if preprocessed:
@@ -2301,15 +2297,16 @@ class TabFeedback(ttk.Frame):
                 return 0
 
             # ----------------------------------------------------------
-            # 无视频路径 → 常规 SDK 回灌 (原逻辑)
+            # 无视频路径 → 常规 SDK 回灌 (单任务单板)
             # ----------------------------------------------------------
             template = load_replay_sdk_template()
             if not template:
                 print("[!] config.yaml 中未找到 replay_sdk_template")
                 return 1
-            n = ctx["n"]
+            # 普通 SDK 回灌: 只有 1 个任务, 固定 1 块板
+            n = 1
 
-            print(f"\n[*] 生成 SDK 回灌脚本 ({n} 块板)...")
+            print(f"\n[*] 生成 SDK 回灌脚本 (1 块板)...")
             scripts = []
             v = dict(vars_map)
             v["INPUT_SUBPATH"] = ctx["input_subpath"]
@@ -2359,19 +2356,21 @@ class TabFeedback(ttk.Frame):
                         pass
 
             from devboard_toolkit.batch_replay import _launch_terminals
-            _launch_terminals(
+            ctx["procs"].extend(_launch_terminals(
                 _PROJECT_ROOT, assignments,
                 log_dir=log_dir, app_suffix=suffix,
                 delete_script=delete_script,
-            )
+            ))
 
             print("\n[+] 已启动多终端回灌,请在各终端窗口观察输出")
-            # 等待所有板写完 .done 标记 (避免"启动即完成"误报)
-            ok = self._wait_all_boards_done(board_names, log_dir, stop_event)
-            # 回收板到共享池 (否则永久占用, 下次任务检测会一直排除)
-            self._pool_return_batch(board_names)
+
+            # 等待所有板完成 (轮询 .done 文件)
+            ok = self._wait_all_boards_done(
+                board_names, log_dir, stop_event,
+                poll_interval=5, timeout_sec=86400)
             if not ok:
                 return 2
+            print("[+] SDK 回灌完成")
             return 0
 
     def _check_preprocessed(self, video_file: str) -> bool:
@@ -2441,18 +2440,37 @@ class TabFeedback(ttk.Frame):
         if selected == "全部停止":
             for tid, t in running.items():
                 t["stop_event"].set()
+                self._kill_task_procs(t)
                 self.log_panel.log(f"[{tid}] 用户中止回灌", "err")
             return
 
         if selected and selected in running:
             running[selected]["stop_event"].set()
+            self._kill_task_procs(running[selected])
             self.log_panel.log(f"[{selected}] 用户中止回灌", "err")
         elif len(running) == 1:
             tid = list(running.keys())[0]
             running[tid]["stop_event"].set()
+            self._kill_task_procs(running[tid])
             self.log_panel.log(f"[{tid}] 用户中止回灌", "err")
         else:
             self.log_panel.log("请从下拉框选择要停止的任务", "warn")
+
+    def _kill_task_procs(self, task: dict):
+        """终止任务启动的所有终端进程 (wt 窗口/子进程)"""
+        procs = task.get("ctx", {}).get("procs", []) or []
+        killed = 0
+        for p in procs:
+            try:
+                if p.poll() is None:  # 仍在运行
+                    p.kill()
+                    killed += 1
+            except Exception:
+                pass
+        # 清空, 避免重复 kill
+        task.setdefault("ctx", {})["procs"] = []
+        if killed:
+            self.log_panel.log(f"  已终止 {killed} 个终端进程", "info")
 
     def _on_open_dir(self):
         if not self._replay_folder or not self._unc_testbed:

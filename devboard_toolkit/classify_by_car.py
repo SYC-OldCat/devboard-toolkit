@@ -32,10 +32,9 @@ PATH_MAPPING = {
 
 
 def normalize_path(p: str) -> str:
-    """统一路径格式: UNC 共享前缀 → 板端 Linux 路径, 反斜杠转正斜杠"""
     for src, dst in PATH_MAPPING.items():
-        if src in p:
-            p = p.replace(src, dst)
+        if src in p.replace("/", "\\"):
+            p = p.replace("/", "\\").replace(src, dst)
             break
     return p.replace("\\", "/")
 
@@ -120,7 +119,7 @@ def extract_car_type(path: str) -> str:
     parts = path.replace("\\", "/").lower().split("/")
     for p in reversed(parts):
         for key, car in CAR_KEYWORDS:
-            if key in p:
+            if key.lower() in p:
                 return car
     return "unknown"
 

@@ -594,7 +594,7 @@ def _launch_terminals(project_root: str,
                       log_dir: str = "",
                       app_suffix: str = "",
                       delete_script: bool = False,
-                      no_reboot_boards: set = None) -> None:
+                      no_reboot_boards: set = None) -> list:
     """为每个板开终端,运行 per_board_runner.py
 
     优先用 Windows Terminal 多标签页(一个窗口 N 个标签):
@@ -609,6 +609,9 @@ def _launch_terminals(project_root: str,
         app_suffix: 感知包后缀,用于日志文件名
         delete_script: 回灌结束后自动删除脚本
         no_reboot_boards: 集合,板名在其中的会传 --no-reboot (接力跳过reboot)
+
+    Returns:
+        list: 启动的 Popen 进程对象列表 (用于取消时 kill)
     """
     # --- exe 打包适配: frozen 环境下用 per_board_runner.exe, 否则用 .py ---
     if getattr(sys, 'frozen', False):
@@ -645,6 +648,8 @@ def _launch_terminals(project_root: str,
         """返回该板的特有参数 (--no-reboot 等)"""
         return ["--no-reboot"] if board in no_reboot_boards else []
 
+    procs = []  # 保存启动的进程, 用于取消时 kill
+
     if use_wt:
         # 用单条 wt 命令 + ; 分隔符一次性创建所有标签页
         # 避免 -w 0 因第一个窗口未初始化而找不到目标窗口的问题
@@ -662,7 +667,7 @@ def _launch_terminals(project_root: str,
             wt_cmd.extend([runner_path, board, folder, script_name])
             wt_cmd.extend(extra_args)
             wt_cmd.extend(_board_args(board))
-        subprocess.Popen(wt_cmd, cwd=project_root)
+        procs.append(subprocess.Popen(wt_cmd, cwd=project_root))
     else:
         for i, (board, folder, script_name) in enumerate(assignments, 1):
             host = boards.get(board, {}).get("host", board)
@@ -673,11 +678,13 @@ def _launch_terminals(project_root: str,
                 cmd.append(python_exe)
             cmd += [runner_path, board, folder, script_name]
             cmd += extra_args + _board_args(board)
-            subprocess.Popen(
+            procs.append(subprocess.Popen(
                 cmd,
                 cwd=project_root,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
+            ))
+
+    return procs
 
 
 # ============================================================
