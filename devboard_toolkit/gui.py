@@ -2100,8 +2100,8 @@ class TabFeedback(ttk.Frame):
                         print("[!] 未预处理素材需要素材相对路径, 请填写")
                         return 1
 
-                    # 目标目录: UNC回灌路径/input/{USER}/{素材相对路径}/
-                    target_base = os.path.join(unc_replay_folder, "input", ctx["user"], input_subpath)
+                    # 目标目录: UNC回灌路径/input/{素材相对路径}/
+                    target_base = os.path.join(unc_replay_folder, "input", input_subpath)
                     os.makedirs(target_base, exist_ok=True)
                     print(f"  目标目录: {target_base}")
 
@@ -2204,6 +2204,11 @@ class TabFeedback(ttk.Frame):
                         delete_script=delete_script,
                     )
                     print(f"\n  [+] SDK 回灌已启动 ({len(board_names)} 块板)")
+                    # 等待 Step1 SDK 回灌完成再进 Step2 (避免板状态混乱)
+                    ok = self._wait_all_boards_done(board_names, log_dir, stop_event)
+                    self._pool_return_batch(board_names)
+                    if not ok:
+                        return 2
 
                 # === Step 2: 已预处理分支 (classify_by_car 生成 txt → 列表回灌) ===
                 if preprocessed:
@@ -2361,6 +2366,12 @@ class TabFeedback(ttk.Frame):
             )
 
             print("\n[+] 已启动多终端回灌,请在各终端窗口观察输出")
+            # 等待所有板写完 .done 标记 (避免"启动即完成"误报)
+            ok = self._wait_all_boards_done(board_names, log_dir, stop_event)
+            # 回收板到共享池 (否则永久占用, 下次任务检测会一直排除)
+            self._pool_return_batch(board_names)
+            if not ok:
+                return 2
             return 0
 
     def _check_preprocessed(self, video_file: str) -> bool:

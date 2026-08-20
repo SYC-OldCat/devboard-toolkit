@@ -314,7 +314,7 @@ replay_sdk_template: |
 
   app_path={{APP_PATH}}
   app_log_name=app_log.txt
-  input_material_list_txt=$PWD/input/{{USER}}/{{INPUT_SUBPATH}}
+  input_material_list_txt=$PWD/input/{{INPUT_SUBPATH}}
   _materialSharePath=//172.17.12.118/Model_Test/TestSpace/Personal_Space
   _materialMountPath=/mnt
 

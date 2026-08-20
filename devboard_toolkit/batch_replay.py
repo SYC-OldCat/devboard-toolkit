@@ -1048,7 +1048,7 @@ def full_auto_main() -> int:
         print(f"\n[6/7] 生成 SDK 回灌脚本(单板, 不分片)...")
         print(f"      感知包名 : {app_path}")
         print(f"      后缀     : {suffix}")
-        print(f"      素材路径 : $PWD/input/{user}/{input_subpath}")
+        print(f"      素材路径 : $PWD/input/{input_subpath}")
         scripts = []
         path = _gen_sdk_scripts(
             template, vars_map, unc_replay_folder, car_model, input_subpath
@@ -1087,7 +1087,7 @@ def full_auto_main() -> int:
     if replay_mode == "list":
         print(f"  子 txt  : {len(sub_files)} 个")
     else:
-        print(f"  素材路径: $PWD/input/{user}/{input_subpath}")
+        print(f"  素材路径: $PWD/input/{input_subpath}")
     print(f"  脚本    : {len(scripts)} 个")
     print()
     print("  查看进度: 在各终端窗口观察输出")
