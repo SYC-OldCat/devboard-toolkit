@@ -815,7 +815,46 @@ class TabFeedback(ttk.Frame):
         self.sdk_path_var = tk.StringVar()
         ttk.Entry(row_sdk_path, textvariable=self.sdk_path_var, width=30).pack(
             side="left", fill="x", expand=True)
-        ttk.Label(row_sdk_path, text="例: 20260810/0452 或 20260810\\0452",
+
+        def _browse_sdk_path():
+            # 默认起始目录: 回灌环境/input/用户名/
+            init_dir = os.getcwd()
+            if self._unc_testbed and self._replay_folder:
+                base = os.path.normpath(
+                    os.path.join(self._unc_testbed, self._replay_folder))
+                user = self.sdk_user_var.get().strip()
+                if user:
+                    candidate = os.path.join(base, "input", user)
+                    if os.path.isdir(candidate):
+                        init_dir = candidate
+                    elif os.path.isdir(os.path.join(base, "input")):
+                        init_dir = os.path.join(base, "input")
+                elif os.path.isdir(os.path.join(base, "input")):
+                    init_dir = os.path.join(base, "input")
+
+            p = filedialog.askdirectory(
+                title="选择素材目录 (input 下的子目录)",
+                initialdir=init_dir)
+            if not p:
+                return
+
+            # 从路径中提取 input 之后的相对路径
+            parts = p.replace("/", "\\").split("\\")
+            idx = None
+            for i, part in enumerate(parts):
+                if part.lower() == "input":
+                    idx = i
+            if idx is not None and idx < len(parts) - 1:
+                subpath = "/".join(parts[idx + 1:])
+                self.sdk_path_var.set(subpath)
+            else:
+                messagebox.showwarning(
+                    "提示",
+                    f"未在所选路径中找到 input 目录\n{p}")
+
+        ttk.Button(row_sdk_path, text="浏览…", width=8,
+                   command=_browse_sdk_path).pack(side="left", padx=(4, 0))
+        ttk.Label(row_sdk_path, text="(浏览选目录自动提取, 或手动输入)",
                   style="Hint.TLabel").pack(side="left", padx=(8, 0))
 
         # 视频路径 (智能检测: 已预处理 → 列表回灌, 未预处理 → 复制+预处理+SDK回灌)
