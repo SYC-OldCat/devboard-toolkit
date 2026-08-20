@@ -2145,13 +2145,13 @@ class TabFeedback(ttk.Frame):
                     else:
                         print(f"  [+] ADAS 预处理完成")
 
-                    # 常规 SDK 回灌
-                    print(f"\n  [*] 启动常规 SDK 回灌 ({ctx['n']} 块板)...")
+                    # 常规 SDK 回灌: 未预处理素材只有一个 input_subpath, 固定 1 块板
+                    print(f"\n  [*] 启动常规 SDK 回灌 (1 块板)...")
                     template = load_replay_sdk_template()
                     if not template:
                         print("[!] config.yaml 中未找到 replay_sdk_template")
                         return 1
-                    n_sdk = ctx["n"]
+                    n_sdk = 1
                     scripts = []
                     v = dict(vars_map)
                     v["INPUT_SUBPATH"] = input_subpath
@@ -2205,6 +2205,15 @@ class TabFeedback(ttk.Frame):
                         delete_script=delete_script,
                     ))
                     print(f"\n  [+] SDK 回灌已启动 ({len(board_names)} 块板)")
+
+                    # 等待 Step1 SDK 回灌完成, 释放板到空闲池供 Step2 列表回灌使用
+                    ok = self._wait_all_boards_done(
+                        board_names, log_dir, stop_event,
+                        poll_interval=5, timeout_sec=86400)
+                    self._pool_return_batch(board_names)
+                    if not ok:
+                        return 2
+                    print(f"  [+] Step1 SDK 回灌完成, 释放 {len(board_names)} 块板到空闲池")
 
                 # === Step 2: 已预处理分支 (classify_by_car 生成 txt → 列表回灌) ===
                 if preprocessed:
