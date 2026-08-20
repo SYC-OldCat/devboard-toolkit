@@ -343,6 +343,14 @@ def _extract_artifact(file_path: str, out_dir: Optional[str] = None) -> str:
                     break
         out_dir = str(fp.with_name(name))
 
+    # 先清空旧产物 (防止不同版本 .so / config 残留互相污染, 和 runtime 策略一致)
+    import shutil as _shutil_art
+    if os.path.exists(out_dir):
+        try:
+            _shutil_art.rmtree(out_dir)
+        except Exception:
+            # 目录被占用等情况退化为文件级覆盖, 不阻塞主流程
+            pass
     os.makedirs(out_dir, exist_ok=True)
     name_lower = fp.name.lower()
 

@@ -233,19 +233,37 @@ replay_list_template: |
   fi
 
 
+  _crash_hit=0
   while [ -s "${_run_list}" ]; do
 
     export materialInputPath="${_run_list}"
     ( MALLOC_ARENA_MAX=4 ./${app_path} ) 2>&1 | tee "${_run_log}"
+    # 捕获实际 app 的退出码 (避免被 tee 干扰)
+    set -o pipefail 2>/dev/null
+    _app_exit=${PIPESTATUS[0]:-$?}
+    set +o pipefail 2>/dev/null
     _ret_ok=0
     _fail_hit=0
+    _local_crash=0
 
     if grep -q "testbed->run ret = 0" "${_run_log}"; then
       _ret_ok=1
     fi
 
+    # 失败判定: 旧 pattern + crash/段错误 + 非0退出码
     if grep -Eq "testbed->run ret = [^0]|testbed_error_code:[1-9]|ERROR ARC_ADAS_Initial" "${_run_log}"; then
       _fail_hit=1
+    fi
+    if grep -Eq "=== CRASH: signal [0-9]+|Segmentation fault|Aborted \(|core dumped|Floating point exception|Illegal instruction" "${_run_log}"; then
+      _fail_hit=1
+      _local_crash=1
+      _crash_hit=1
+      echo "[CRASH] 感知包崩溃信号已识别" | tee -a "${_fail_list}"
+    fi
+    if [ "${_app_exit}" -ne 0 ] && [ "${_ret_ok}" -eq 0 ]; then
+      # 没有明确成功打印且退出码非0 → 视为失败
+      _fail_hit=1
+      echo "[EXIT] 感知包非零退出 exit_code=${_app_exit}" | tee -a "${_fail_list}"
     fi
 
     if [ "${_ret_ok}" -eq 1 ] && [ "${_fail_hit}" -eq 0 ]; then
@@ -264,7 +282,7 @@ replay_list_template: |
     _old_cnt=$(wc -l < "${_run_list}")
     _new_cnt=$(wc -l < "${_tmp_next}" 2>/dev/null || echo 0)
 
-    if [ "${_old_cnt}" = "${_new_cnt}" ]; then
+    if [ "${_old_cnt}" = "${_new_cnt}" ] || [ "${_new_cnt}" = "0" ]; then
       _first_line=$(head -n 1 "${_run_list}")
       if [ "${_first_line}" != "${_bad_line}" ]; then
         echo "${_first_line}" >> "${_fail_list}"
@@ -282,16 +300,23 @@ replay_list_template: |
   else
     echo "[*] 本分片无失败素材"
   fi
+  # 脚本退出码反映实际成败 (per_board_runner 据此写 .done)
+  if [ "${_crash_hit}" -eq 1 ]; then
+    exit 4
+  elif [ -s "${_fail_list}" ]; then
+    exit 3
+  else
+    exit 0
+  fi
 
-replay_sdk_template: '#!/bin/sh
-
+replay_sdk_template: |
+  #!/bin/sh
 
   app_path={{APP_PATH}}
   app_log_name=app_log.txt
   input_material_list_txt=$PWD/input/{{USER}}/{{INPUT_SUBPATH}}
   _materialSharePath=//172.17.12.118/Model_Test/TestSpace/Personal_Space
   _materialMountPath=/mnt
-
 
   export LD_LIBRARY_PATH=$PWD/lib:$LD_LIBRARY_PATH
   export materialInputPath=${input_material_list_txt}
@@ -316,8 +341,6 @@ replay_sdk_template: '#!/bin/sh
   export disableResultSave=0
   export enablePreLoadSignalData=0
   env MALLOC_ARENA_MAX=4 ./${app_path}
-
-  '
 jenkins:
   server: http://172.17.189.18:8080
   username: qatest

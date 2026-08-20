@@ -498,6 +498,8 @@ def _split_txt(txt_path: str, n: int, out_dir: str, sort_by_size: bool = False) 
         total_size = sum(sizes)
         # 全 0 兜底: 所有 UNC 都访问不到 → 退化为原始顺序均分, 避免 LPT 堆全 0 都塞到第 1 片
         if total_size == 0:
+            print(f"  [!] LPT 调度: 所有 {total} 个素材大小均为 0 "
+                  f"(UNC网络路径不可达? 已跳过 PathMapping 候选?), 退化为原始顺序均分")
             size = total // n
             remainder = total % n
             chunks = []

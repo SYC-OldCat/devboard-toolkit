@@ -1201,6 +1201,7 @@ class TabFeedback(ttk.Frame):
             messagebox.showwarning("提示", "回灌环境尚未扫描完成,请稍后再试")
             return
 
+        # 主线程只做最小校验: 板数>=1 (真正的空闲板检测放在任务线程内,避免GUI卡住)
         n = self.board_count.get()
         if n < 1:
             messagebox.showwarning("提示", "开发板数量至少为 1")
@@ -1363,6 +1364,37 @@ class TabFeedback(ttk.Frame):
         print(f"[*] 日期: {ctx['date']}")
         print(f"[*] 回灌目录(UNC): {unc_replay_folder}")
         print(f"[*] 回灌目录(板端): {linux_replay_folder}")
+
+        # === 启动前空闲板检测 (放在任务线程,不阻塞 GUI) + 动态修正 ctx["n"] ===
+        _idle_n = 0
+        try:
+            idle_init = self._sync_detect_boards(stop_event, exclude_busy=True)
+            if idle_init:
+                self._pool_add(idle_init)
+                for _bn in idle_init:
+                    self._board_first_run[_bn] = True
+                _idle_n = len(idle_init)
+                # 更新 GUI Spinbox 上限
+                try:
+                    self._update_board_spin(_idle_n)
+                except Exception:
+                    pass
+                print(f"  [*] 启动前检测到 {_idle_n} 块空闲板: {', '.join(idle_init)}")
+            else:
+                print("  [!] 启动前未检测到空闲板 (后续增量检测会补充)")
+        except Exception as _e:
+            print(f"  [!] 启动前板检测异常: {_e}")
+            idle_init = []
+
+        # 修正 ctx["n"]: 用户选择不能超过实际空闲板数 (避免下游 L1868 min(ctx["n"]) 卡死)
+        if _idle_n > 0:
+            _orig_n = ctx["n"]
+            ctx["n"] = min(_orig_n, _idle_n)
+            if ctx["n"] != _orig_n:
+                print(f"  [i] 板数自动调整: {_orig_n} → {ctx['n']} (不超过空闲板数)")
+        if ctx["n"] < 1:
+            # 没检测到板但用户填了,给一个至少为 1 的安全下限,下游会再次根据空闲池微调
+            ctx["n"] = max(ctx["n"], 1)
 
         # fcf 标定覆盖: 用户选了非 default 版本时,复制覆盖回灌目录中的标定文件
         fcf_ver = ctx["fcf_version"]
@@ -1715,16 +1747,38 @@ class TabFeedback(ttk.Frame):
 
                 # 1. 检查所有正在跑的 txt 的板完成情况
                 #    完成板优先分配给同一 txt 的剩余分片(接力续跑), 无剩余才退回池
+                #    注意: 读取 .done 里的 exit_code, 失败板(exit!=0)不允许接力,直接退回池
                 completed_boards_pool = []  # 最终退回共享池的板
                 boards_to_relay = []        # 待接力的板: [(board_name, txt_path)]
+                failed_boards_txts = set()  # 发生板级失败的 txt, 需丢弃其剩余 pending
                 for txt_path, info in list(running_txts.items()):
                     still_running = []
                     for bn in info["boards"]:
                         safe_bn = bn.replace("/", "_").replace("\\", "_")
                         dp = os.path.join(log_dir, f"{safe_bn}.done")
                         if os.path.isfile(dp):
-                            # 先尝试接力该 txt 的剩余分片
-                            if info.get("pending"):
+                            # 解析 .done 的 exit_code
+                            done_exit = 0
+                            try:
+                                with open(dp, "r", encoding="utf-8") as df:
+                                    for dline in df:
+                                        if dline.startswith("exit_code="):
+                                            try:
+                                                done_exit = int(dline.strip().split("=", 1)[1])
+                                            except Exception:
+                                                done_exit = 0
+                                            break
+                            except Exception:
+                                done_exit = 0
+                            if done_exit != 0:
+                                # 失败板: 不参与接力, 直接退回池, 并标记该 txt 不再接力
+                                reason = {3: "失败素材", 4: "感知包CRASH"}.get(
+                                    done_exit, f"exit={done_exit}")
+                                print(f"    [✗] {bn} 失败 ({os.path.basename(txt_path)}) [{reason}], "
+                                      f"退回空闲池 (不参与接力)")
+                                completed_boards_pool.append(bn)
+                                failed_boards_txts.add(txt_path)
+                            elif info.get("pending"):
                                 boards_to_relay.append((bn, txt_path))
                                 print(f"    [✓] {bn} 完成 ({os.path.basename(txt_path)}) "
                                       f"→ 接力续跑 (还剩 {len(info['pending'])} 份)")
@@ -1735,8 +1789,19 @@ class TabFeedback(ttk.Frame):
                         else:
                             still_running.append(bn)
                     info["boards"] = still_running
-                    # 该 txt 所有板完成 且 没有待接力分片 → 标记完成
-                    if not still_running and not info.get("pending"):
+
+                # 对失败板所在的 txt: 丢弃其剩余 pending (避免反复拿有问题的板接力)
+                for ftxt in failed_boards_txts:
+                    finfo = running_txts.get(ftxt)
+                    if finfo and finfo.get("pending"):
+                        dropped = len(finfo["pending"])
+                        print(f"  [!] {os.path.basename(ftxt)}: 因板级失败, 放弃 {dropped} 份待接力分片")
+                        finfo["pending"] = []
+
+                # 所有已无在跑板且无待接力的 txt → 标记完成
+                for txt_path in list(running_txts.keys()):
+                    info2 = running_txts[txt_path]
+                    if not info2.get("boards") and not info2.get("pending"):
                         del running_txts[txt_path]
                         print(f"\n[+] {os.path.basename(txt_path)} 回灌完成 "
                               f"(剩余 {len(queue)} 个待回灌, {len(running_txts)} 个进行中)")
@@ -3499,6 +3564,14 @@ class SettingsDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 
 class App(tk.Tk):
+    """主窗口"""
+
+    # GitHub 仓库信息 (用于自动更新)
+    _GH_OWNER = "SYC-OldCat"
+    _GH_REPO = "devboard-toolkit"
+    _GH_BRANCH = "master"
+    _EXE_NAME = "devboard_toolkit.exe"
+
     def __init__(self):
         super().__init__()
         self.title("DevBoard Toolkit")
@@ -3540,6 +3613,263 @@ class App(tk.Tk):
                   style="Hint.TLabel").pack(side="left")
         ttk.Label(status, text="4 Tab 已连接实际功能",
                   style="Hint.TLabel").pack(side="right")
+
+        # exe 模式: 启动后 2s 后台检测更新 (不阻塞 GUI)
+        if getattr(sys, 'frozen', False):
+            self.after(2000, self._check_update)
+
+    # ------------------------------------------------------------------
+    # 自动更新
+    # ------------------------------------------------------------------
+
+    def _read_local_version(self) -> str:
+        """读取本地 _version.txt (打包时注入的 git commit hash)"""
+        exe_dir = os.path.dirname(sys.executable)
+        ver_path = os.path.join(exe_dir, "_version.txt")
+        try:
+            with open(ver_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def _check_update(self):
+        """后台检测 GitHub 是否有新版本"""
+        local_hash = self._read_local_version()
+        if not local_hash:
+            # 无版本文件 → 开发模式或首次运行, 跳过
+            return
+
+        def _worker():
+            import json as _json
+            import urllib.request
+            import urllib.error
+
+            api_url = (f"https://api.github.com/repos/{self._GH_OWNER}/"
+                       f"{self._GH_REPO}/commits/{self._GH_BRANCH}")
+
+            try:
+                req = urllib.request.Request(api_url, headers={
+                    "User-Agent": "devboard-toolkit-updater",
+                    "Accept": "application/vnd.github+json",
+                })
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = _json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                # 网络不通 / API 不可达 → 静默跳过
+                return
+
+            remote_hash = (data.get("sha") or "")[:12]
+            if not remote_hash:
+                return
+
+            # 比较前 12 位 (GitHub short hash)
+            if local_hash[:12] == remote_hash[:12]:
+                # 已是最新
+                return
+
+            # 有更新 → 主线程弹窗确认
+            commit_msg = ""
+            try:
+                commit_msg = data.get("commit", {}).get(
+                    "message", "").split("\n")[0][:60]
+            except Exception:
+                pass
+
+            self.after(0, lambda: self._prompt_update(
+                remote_hash, commit_msg))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _prompt_update(self, remote_hash: str, commit_msg: str):
+        """弹窗提示用户是否更新"""
+        msg = (f"发现新版本\n\n"
+               f"当前版本: {self._read_local_version()[:12]}\n"
+               f"最新版本: {remote_hash}\n"
+               f"更新内容: {commit_msg}\n\n"
+               f"是否立即下载并更新？")
+        rc = messagebox.askyesno("自动更新", msg, default="yes")
+        if rc:
+            self._do_update(remote_hash)
+
+    def _do_update(self, remote_hash: str):
+        """下载新 exe + _version.txt + 写 .bat 替换脚本 + 重启"""
+        import json as _json
+        import urllib.request
+        import urllib.error
+        import tempfile
+
+        # 1. 获取最新 Release 的 asset download URL
+        releases_url = (f"https://api.github.com/repos/{self._GH_OWNER}/"
+                        f"{self._GH_REPO}/releases/latest")
+
+        try:
+            req = urllib.request.Request(releases_url, headers={
+                "User-Agent": "devboard-toolkit-updater",
+                "Accept": "application/vnd.github+json",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                rel_data = _json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            messagebox.showerror("更新失败", f"无法获取 Release 信息:\n{e}")
+            return
+
+        # 从 Release assets 中提取 exe 和 _version.txt 的下载地址
+        exe_url = None
+        ver_url = None
+        release_tag = rel_data.get("tag_name", remote_hash)
+        for asset in rel_data.get("assets", []):
+            name = asset.get("name", "").lower()
+            if name == self._EXE_NAME.lower():
+                exe_url = asset.get("browser_download_url")
+            elif name == "_version.txt":
+                ver_url = asset.get("browser_download_url")
+
+        if not exe_url:
+            messagebox.showerror("更新失败",
+                                f"Release {release_tag} 中未找到 {self._EXE_NAME}")
+            return
+
+        # 2. 弹出下载进度窗口
+        dl_win = tk.Toplevel(self)
+        dl_win.title("正在更新")
+        dl_win.geometry("420x160")
+        dl_win.resizable(False, False)
+        dl_win.transient(self)
+        dl_win.grab_set()
+
+        ttk.Label(dl_win, text=f"正在下载 {release_tag}...",
+                  style="SubTitle.TLabel").pack(pady=(16, 8))
+        prog = ttk.Progressbar(dl_win, mode="determinate",
+                               style="Horizontal.TProgressbar")
+        prog.pack(fill="x", padx=24, pady=4)
+        pct_var = tk.StringVar(value="准备中...")
+        ttk.Label(dl_win, textvariable=pct_var,
+                  style="Hint.TLabel").pack(pady=4)
+
+        def _download_thread():
+            try:
+                tmp_dir = tempfile.gettempdir()
+                tmp_exe = os.path.join(tmp_dir, f"{self._EXE_NAME}.new")
+                tmp_ver = os.path.join(tmp_dir, "_version.new.txt")
+
+                # 下载 exe (大文件, 带进度)
+                req = urllib.request.Request(exe_url, headers={
+                    "User-Agent": "devboard-toolkit-updater",
+                })
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    total = int(resp.headers.get("Content-Length", 0))
+                    if total > 0:
+                        prog.configure(maximum=total)
+                    downloaded = 0
+                    with open(tmp_exe, "wb") as out:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                pct = int(downloaded / total * 100)
+                                self.after(0, lambda p=pct: (
+                                    prog.configure(value=p),
+                                    pct_var.set(f"下载中 {p}%")
+                                ))
+
+                # 下载 _version.txt (小文件)
+                new_hash = remote_hash
+                if ver_url:
+                    self.after(0, lambda: pct_var.set("下载版本信息..."))
+                    req2 = urllib.request.Request(ver_url, headers={
+                        "User-Agent": "devboard-toolkit-updater",
+                    })
+                    with urllib.request.urlopen(req2, timeout=15) as resp2:
+                        new_hash = resp2.read().decode("utf-8").strip()
+                    with open(tmp_ver, "w", encoding="utf-8") as vf:
+                        vf.write(new_hash)
+
+                # 下载完成 → 写 .bat 替换脚本
+                self.after(0, lambda: pct_var.set("准备替换..."))
+                self.after(0, lambda: self._swap_and_restart(
+                    tmp_exe, tmp_ver if ver_url else None,
+                    new_hash, dl_win))
+            except Exception as e:
+                self.after(0, lambda: (
+                    dl_win.destroy(),
+                    messagebox.showerror("更新失败", f"下载失败:\n{e}")
+                ))
+
+        threading.Thread(target=_download_thread, daemon=True).start()
+
+    def _swap_and_restart(self, new_exe: str, new_ver: str,
+                          new_hash: str, dl_win):
+        """生成 .bat 脚本: 等待当前 exe 退出 → 覆盖 → 更新 _version.txt → 重启"""
+        import tempfile
+
+        dl_win.destroy()
+
+        current_exe = sys.executable
+        exe_dir = os.path.dirname(current_exe)
+        target_path = os.path.join(exe_dir, self._EXE_NAME)
+        version_path = os.path.join(exe_dir, "_version.txt")
+        current_pid = os.getpid()
+        bat_path = os.path.join(tempfile.gettempdir(), "devboard_updater.bat")
+
+        bat_lines = [
+            "@echo off",
+            "chcp 65001 >nul",
+            "echo 正在更新 DevBoard Toolkit...",
+            "echo.",
+            "",
+            ":wait",
+            f'tasklist /FI "PID eq {current_pid}" 2>nul | find "{current_pid}" >nul',
+            "if %ERRORLEVEL%==0 (",
+            "    timeout /t 1 >nul",
+            "    goto wait",
+            ")",
+            "",
+            "echo 正在替换文件...",
+            f'copy /Y "{new_exe}" "{target_path}"',
+            "if %ERRORLEVEL% neq 0 (",
+            f'    echo 替换失败！请手动将 {new_exe} 复制到 {target_path}',
+            "    pause",
+            f'    del "{bat_path}"',
+            "    exit /b 1",
+            ")",
+            f'del "{new_exe}" 2>nul',
+        ]
+
+        # 如果有 _version.txt, 也覆盖
+        if new_ver:
+            bat_lines.extend([
+                f'copy /Y "{new_ver}" "{version_path}"',
+                f'del "{new_ver}" 2>nul',
+            ])
+        else:
+            # 没有独立 _version.txt → 直接写 hash
+            bat_lines.append(f'echo {new_hash}> "{version_path}"')
+
+        bat_lines.extend([
+            "echo 更新完成，正在重启...",
+            f'start "" "{target_path}"',
+            f'del "{bat_path}"',
+        ])
+
+        bat_content = "\r\n".join(bat_lines)
+
+        try:
+            with open(bat_path, "w", encoding="gbk") as f:
+                f.write(bat_content)
+        except Exception as e:
+            messagebox.showerror("更新失败", f"无法创建更新脚本:\n{e}")
+            return
+
+        # 启动 .bat → 退出当前 exe
+        import subprocess
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        self.quit()
 
     def _open_settings(self):
         SettingsDialog(self, on_save=self._save_settings, config_path=_CONFIG_YAML_PATH)
