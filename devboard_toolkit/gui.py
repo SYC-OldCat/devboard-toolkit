@@ -3824,6 +3824,9 @@ class App(tk.Tk):
         bat_path = os.path.join(tempfile.gettempdir(), "devboard_updater.bat")
         log_path = os.path.join(tempfile.gettempdir(), "devboard_updater.log")
 
+        # 改用 VBScript 来启动 bat (更可靠, 不显示黑框)
+        vbs_path = os.path.join(tempfile.gettempdir(), "devboard_updater.vbs")
+
         bat_lines = [
             "@echo off",
             "chcp 65001 >nul",
@@ -3867,8 +3870,11 @@ class App(tk.Tk):
             bat_lines.append(f'echo {new_hash}> "{version_path}"')
 
         bat_lines.extend([
-            f'echo 更新完成 >> "{log_path}"',
-            f'start "" "{target_path}"',
+            f'echo [{time.strftime("%H:%M:%S")}] 更新完成 >> "{log_path}"',
+            f'echo 正在重启... >> "{log_path}"',
+            # 用 start /b + timeout 确保进程启动
+            f'start "" /B "{target_path}"',
+            f'timeout /t 1 >nul',
             f'del "{bat_path}"',
         ])
 
@@ -3877,27 +3883,41 @@ class App(tk.Tk):
         try:
             with open(bat_path, "w", encoding="gbk") as f:
                 f.write(bat_content)
-            # 验证 bat 文件已创建
             if not os.path.isfile(bat_path):
                 raise RuntimeError(".bat 文件创建失败")
         except Exception as e:
             messagebox.showerror("更新失败", f"无法创建更新脚本:\n{e}")
             return
 
-        # 记录日志文件路径, 方便用户排查
-        log_msg = f"更新日志: {log_path}"
+        # 用 VBScript 静默启动 bat (不显示黑框, 更可靠)
+        vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """{bat_path}""", 0, False
+'''
+        try:
+            with open(vbs_path, "w", encoding="utf-8") as f:
+                f.write(vbs_content)
+        except Exception:
+            pass
 
-        # 启动 .bat → 延迟 1s 再退出, 确保 bat 已被系统加载
+        # 启动 VBS 或直接用 cmd
         import subprocess
-        subprocess.Popen(
-            ["cmd", "/c", bat_path],
-            cwd=tempfile.gettempdir(),
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            close_fds=True,
-        )
+        if os.path.isfile(vbs_path):
+            # 优先用 VBS (静默)
+            subprocess.Popen(
+                ["wscript.exe", vbs_path],
+                cwd=tempfile.gettempdir(),
+                close_fds=True,
+            )
+        else:
+            # 回退: 用 cmd (显示黑框但可靠)
+            subprocess.Popen(
+                ["cmd", "/c", bat_path],
+                cwd=tempfile.gettempdir(),
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                close_fds=True,
+            )
 
-        # 不立即退出, 等 1s 让 bat 脚本的 wait 循环先启动
-        # 这样即使文件句柄没立刻释放, bat 也在持续等待
+        # 延迟退出, 确保脚本已启动
         self.after(500, self.quit)
 
     def _open_settings(self):
