@@ -8,12 +8,12 @@ from pathlib import Path
 
 # ==================== 配置区 ====================
 # 修改这里的路径即可运行，无需命令行参数
-TXT_PATH = r"\\hz-iotfs02\Model_Test\TestSpace\Personal_Space\SYC\testbed\fcf_2021\yaq_463.txt"
-OUTPUT_DIR = r"\\hz-iotfs02\Model_Test\TestSpace\Personal_Space\SYC\testbed\fcf_2021\output\YAQ\20260821_V3.1.4_2M_3.1.27223.2290\0452new\output"
+TXT_PATH = r"D:\Desktop\4.22\data\123\SYC_lixiang3.txt"
+OUTPUT_DIR = r"\\hz-iotfs02\Model_Test\TestSpace\Personal_Space\SYC\testbed\list\output\YAQ\20260821_V3.1.4_2M_3.1.27223.2299\lixiang3\output"
 # 可选: 是否覆盖写回原 txt（True=覆盖原文件，False=仅打印结果）
 WRITE_BACK = False
 # 可选: 另存为新文件路径（为空则不另存；非空时写入该路径）
-OUT_PATH = r"\\hz-iotfs02\Model_Test\TestSpace\Personal_Space\SYC\testbed\fcf_2021\123.txt"
+OUT_PATH = r"\\hz-iotfs02\Model_Test\TestSpace\Personal_Space\SYC\testbed\list\SYC_lixiang3.txt"
 # ==============================================
 
 

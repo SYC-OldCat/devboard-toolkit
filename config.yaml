@@ -95,7 +95,7 @@ replay_env:
   windows_host: hz-iotfs02
 car_models:
   '0463': '0463'
-  0508: 0508
+  '0508': '0508'
   '3545': '3545'
   '3554': '3554'
   '3637': '3637'
@@ -158,7 +158,7 @@ car_keywords:
   geely_0452: geely_0452
   geely_463: geely_463
   geely_0463: geely_0463
-  geely_508: geely_508
+  geely_508: geely_0508
   geely_1604: geely_1604
   geely_0508: geely_0508
   geely_5463: geely_5463
@@ -175,7 +175,7 @@ car_keywords:
   '0452': geely_0452
   '463': geely_463
   '0463': geely_0463
-  '508': geely_508
+  '508': geely_0508
   '1604': geely_1604
   '0508': geely_0508
   '5463': geely_5463
@@ -234,81 +234,44 @@ replay_list_template: |
   fi
 
 
+  # 单次跑: testbed 遇到坏素材会自动跳过并继续跑后续素材, 无需循环重跑
+  export materialInputPath="${_run_list}"
+  _exit_code_file="${_tmp_dir}/exit_$$.tmp"
+  ( MALLOC_ARENA_MAX=4 ./${app_path}; echo $? > "${_exit_code_file}" ) 2>&1 | tee "${_run_log}"
+  _app_exit=$(cat "${_exit_code_file}" 2>/dev/null)
+  rm -f "${_exit_code_file}"
+  [ -z "${_app_exit}" ] && _app_exit=1
+
+  # 检测 CRASH (真板级失败, 需丢弃接力)
   _crash_hit=0
-  while [ -s "${_run_list}" ]; do
-
-    export materialInputPath="${_run_list}"
-    # 捕获实际 app 的退出码 (避免被 tee 干扰) - 用临时文件方式兼容 sh (避免 PIPESTATUS 触发 bad substitution)
-    _exit_code_file="${_tmp_dir}/exit_$$.tmp"
-    ( MALLOC_ARENA_MAX=4 ./${app_path}; echo $? > "${_exit_code_file}" ) 2>&1 | tee "${_run_log}"
-    _app_exit=$(cat "${_exit_code_file}" 2>/dev/null)
-    rm -f "${_exit_code_file}"
-    [ -z "${_app_exit}" ] && _app_exit=1
-    _ret_ok=0
-    _fail_hit=0
-    _local_crash=0
-
-    if grep -q "testbed->run ret = 0" "${_run_log}"; then
-      _ret_ok=1
-    fi
-
-    # 失败判定: 旧 pattern + crash/段错误 + 非0退出码
-    if grep -Eq "testbed->run ret = [^0]|testbed_error_code:[1-9]|ERROR ARC_ADAS_Initial" "${_run_log}"; then
-      _fail_hit=1
-    fi
-    if grep -Eq "=== CRASH: signal [0-9]+|Segmentation fault|Aborted \(|core dumped|Floating point exception|Illegal instruction" "${_run_log}"; then
-      _fail_hit=1
-      _local_crash=1
-      _crash_hit=1
-      echo "[CRASH] 感知包崩溃信号已识别" | tee -a "${_fail_list}"
-    fi
-    if [ "${_app_exit}" -ne 0 ] && [ "${_ret_ok}" -eq 0 ]; then
-      # 没有明确成功打印且退出码非0 → 视为失败
-      _fail_hit=1
-      echo "[EXIT] 感知包非零退出 exit_code=${_app_exit}" | tee -a "${_fail_list}"
-    fi
-
-    if [ "${_ret_ok}" -eq 1 ] && [ "${_fail_hit}" -eq 0 ]; then
-      rm -f "${_run_log}" "${_tmp_next}"
-      break
-    fi
-
-    _bad_line=$(grep "Processing file:" "${_run_log}" | tail -n 1 | sed "s/.*Processing file: *//")
-    if [ -z "${_bad_line}" ]; then
-      _bad_line=$(head -n 1 "${_run_list}")
-    fi
-
-    echo "${_bad_line}" >> "${_fail_list}"
-    echo "[SKIP] 坏素材: ${_bad_line}"
-    awk -v pat="${_bad_line}" "BEGIN{f=0} \$0==pat{f=1;next} f" "${_run_list}" > "${_tmp_next}"
-    _old_cnt=$(wc -l < "${_run_list}")
-    _new_cnt=$(wc -l < "${_tmp_next}" 2>/dev/null || echo 0)
-
-    if [ "${_old_cnt}" = "${_new_cnt}" ] || [ "${_new_cnt}" = "0" ]; then
-      _first_line=$(head -n 1 "${_run_list}")
-      if [ "${_first_line}" != "${_bad_line}" ]; then
-        echo "${_first_line}" >> "${_fail_list}"
-        echo "[SKIP] 兜底删除首行: ${_first_line}"
-      fi
-      tail -n +2 "${_run_list}" > "${_tmp_next}"
-    fi
-    mv "${_tmp_next}" "${_run_list}"
-    rm -f "${_run_log}"
-  done
-
-  if [ -s "${_fail_list}" ]; then
-    echo ""
-    echo "[!] 本分片失败素材已保存: $(pwd)/${_fail_list} ($(wc -l < "${_fail_list}") 条)"
-  else
-    echo "[*] 本分片无失败素材"
+  if grep -Eq "=== CRASH: signal [0-9]+|Segmentation fault|Aborted \(|core dumped|Floating point exception|Illegal instruction" "${_run_log}"; then
+    _crash_hit=1
+    echo "[CRASH] 感知包崩溃信号已识别" | tee -a "${_fail_list}"
   fi
+
+  # 检测 testbed 是否正常跑完 (ret=0 或 task end 都算跑完)
+  _done_ok=0
+  if grep -q "testbed->run ret = 0" "${_run_log}"; then
+    _done_ok=1
+  elif grep -q "testbed task end" "${_run_log}"; then
+    _done_ok=1
+  fi
+
   # 脚本退出码反映实际成败 (per_board_runner 据此写 .done)
   if [ "${_crash_hit}" -eq 1 ]; then
+    echo "[!] 本分片感知包 CRASH, 失败信息已保存: $(pwd)/${_fail_list}"
+    rm -f "${_run_log}" "${_tmp_next}"
     exit 4
-  elif [ -s "${_fail_list}" ]; then
-    exit 3
-  else
+  elif [ "${_done_ok}" -eq 1 ]; then
+    # testbed 正常跑完 (坏素材已自动跳过), 视为成功, 不影响接力
+    rm -f "${_fail_list}" "${_run_log}" "${_tmp_next}"
+    echo "[*] 本分片回灌完成"
     exit 0
+  else
+    # testbed 未正常完成 (无 ret=0/task end 且无 CRASH), 保留日志供排查
+    echo "[!] testbed 未正常完成 (exit=${_app_exit}), 日志已保存: $(pwd)/${_run_log}"
+    rm -f "${_tmp_next}"
+    exit 1
   fi
 
 replay_sdk_template: |
