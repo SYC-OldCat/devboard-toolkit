@@ -238,11 +238,12 @@ replay_list_template: |
   while [ -s "${_run_list}" ]; do
 
     export materialInputPath="${_run_list}"
-    ( MALLOC_ARENA_MAX=4 ./${app_path} ) 2>&1 | tee "${_run_log}"
-    # 捕获实际 app 的退出码 (避免被 tee 干扰)
-    set -o pipefail 2>/dev/null
-    _app_exit=${PIPESTATUS[0]:-$?}
-    set +o pipefail 2>/dev/null
+    # 捕获实际 app 的退出码 (避免被 tee 干扰) - 用临时文件方式兼容 sh (避免 PIPESTATUS 触发 bad substitution)
+    _exit_code_file="${_tmp_dir}/exit_$$.tmp"
+    ( MALLOC_ARENA_MAX=4 ./${app_path}; echo $? > "${_exit_code_file}" ) 2>&1 | tee "${_run_log}"
+    _app_exit=$(cat "${_exit_code_file}" 2>/dev/null)
+    rm -f "${_exit_code_file}"
+    [ -z "${_app_exit}" ] && _app_exit=1
     _ret_ok=0
     _fail_hit=0
     _local_crash=0

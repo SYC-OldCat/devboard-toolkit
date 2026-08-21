@@ -1426,12 +1426,17 @@ class TabFeedback(ttk.Frame):
             print(f"  [!] 启动前板检测异常: {_e}")
             idle_init = []
 
-        # 修正 ctx["n"]: 用户选择不能超过实际空闲板数 (避免下游 L1868 min(ctx["n"]) 卡死)
+        # 修正 ctx["n"]: 跟随空闲板数自动调整
+        # - 默认值 1: 上调到实际空闲板数 (避免检测到多块板却只用 1 块拖累回灌)
+        # - 用户主动设置 (>1): 只下调不超过空闲板数, 保留用户上限语义
         if _idle_n > 0:
             _orig_n = ctx["n"]
-            ctx["n"] = min(_orig_n, _idle_n)
+            if _orig_n <= 1:
+                ctx["n"] = _idle_n
+            else:
+                ctx["n"] = min(_orig_n, _idle_n)
             if ctx["n"] != _orig_n:
-                print(f"  [i] 板数自动调整: {_orig_n} → {ctx['n']} (不超过空闲板数)")
+                print(f"  [i] 板数自动调整: {_orig_n} → {ctx['n']} (跟随空闲板数 {_idle_n})")
         if ctx["n"] < 1:
             # 没检测到板但用户填了,给一个至少为 1 的安全下限,下游会再次根据空闲池微调
             ctx["n"] = max(ctx["n"], 1)
@@ -1810,14 +1815,29 @@ class TabFeedback(ttk.Frame):
                                             break
                             except Exception:
                                 done_exit = 0
-                            if done_exit != 0:
-                                # 失败板: 不参与接力, 直接退回池, 并标记该 txt 不再接力
-                                reason = {3: "失败素材", 4: "感知包CRASH"}.get(
-                                    done_exit, f"exit={done_exit}")
-                                print(f"    [✗] {bn} 失败 ({os.path.basename(txt_path)}) [{reason}], "
-                                      f"退回空闲池 (不参与接力)")
+                            if done_exit == 4:
+                                # CRASH: 真板级失败, 不参与接力, 丢弃该 txt 剩余 pending
+                                print(f"    [✗] {bn} 失败 ({os.path.basename(txt_path)}) "
+                                      f"[感知包CRASH], 退回空闲池 (不参与接力)")
                                 completed_boards_pool.append(bn)
                                 failed_boards_txts.add(txt_path)
+                            elif done_exit not in (0, 3):
+                                # 其他异常退出码 (1/2/5...): 保守视为板级失败
+                                print(f"    [✗] {bn} 失败 ({os.path.basename(txt_path)}) "
+                                      f"[exit={done_exit}], 退回空闲池 (不参与接力)")
+                                completed_boards_pool.append(bn)
+                                failed_boards_txts.add(txt_path)
+                            elif done_exit == 3:
+                                # 分片含坏素材 (脚本已跳过并记录到 failed_*.txt), 视为正常完成
+                                if info.get("pending"):
+                                    boards_to_relay.append((bn, txt_path))
+                                    print(f"    [~] {bn} 完成 ({os.path.basename(txt_path)}) "
+                                          f"[含坏素材已跳过] → 接力续跑 "
+                                          f"(还剩 {len(info['pending'])} 份)")
+                                else:
+                                    completed_boards_pool.append(bn)
+                                    print(f"    [~] {bn} 完成 ({os.path.basename(txt_path)}) "
+                                          f"[含坏素材已跳过] → 该 txt 分片全部跑完, 退回空闲池")
                             elif info.get("pending"):
                                 boards_to_relay.append((bn, txt_path))
                                 print(f"    [✓] {bn} 完成 ({os.path.basename(txt_path)}) "
