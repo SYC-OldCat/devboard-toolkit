@@ -6,6 +6,7 @@
     python release.py --build-only     # 只 build, 不 git 提交也不发布
     python release.py --skip-git       # 跳过 git 提交推送 (已手动提交时)
     python release.py --notes "修复..." # 指定 Release notes
+    python release.py --notes-file notes.txt  # 从 UTF-8 文件读取 Release notes (支持多行)
 
 前置条件:
     1. gh CLI 已安装并登录 (gh auth login)
@@ -190,11 +191,24 @@ def main():
                         help="跳过 git 提交推送 (已手动提交时)")
     parser.add_argument("--notes", default="",
                         help="Release notes (默认从 git log 自动生成)")
+    parser.add_argument("--notes-file", default="",
+                        help="从文件读取 Release notes (UTF-8, 支持\\n换行; 与 --notes 二选一, --notes-file 优先)")
     parser.add_argument("--draft", action="store_true",
                         help="创建为草稿 (不公开)")
     parser.add_argument("--skip-build", action="store_true",
                         help="跳过 PyInstaller (已有 dist/ 产物时)")
     args = parser.parse_args()
+
+    # notes 解析: --notes-file 优先于 --notes
+    notes = args.notes
+    if args.notes_file:
+        try:
+            with open(args.notes_file, "r", encoding="utf-8") as f:
+                notes = f.read().strip()
+            print(f"[i] 已从 {args.notes_file} 读取 Release notes ({len(notes)} 字符)")
+        except Exception as e:
+            print(f"[!] 读取 --notes-file 失败: {e}")
+            return 1
 
     print("=" * 60)
     print("  DevBoard Toolkit — Build & Release")
@@ -249,7 +263,7 @@ def main():
     _write_version_file(git_hash)
 
     # 6. 发布
-    ok = _create_release(git_hash, notes=args.notes, draft=args.draft)
+    ok = _create_release(git_hash, notes=notes, draft=args.draft)
     if ok:
         print("\n" + "=" * 60)
         print("  发布完成！用户端 exe 启动后会自动检测到新版本。")

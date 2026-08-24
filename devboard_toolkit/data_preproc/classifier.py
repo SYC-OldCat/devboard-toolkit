@@ -2,31 +2,30 @@
 
 根据 Jira 标题 (summary) 和视频路径 (video_path) 推断车型编号。
 
+车型映射源 (优先级从高到低):
+  1. config.yaml 的 data_proc_car_keywords 段 (title_keywords / path_keywords / default)
+  2. 内置 DEFAULT_DATA_PROC_CAR (config.py 兜底)
+
 匹配优先级:
-  1. summary 含 "XXX车" 关键词 → 取对应车型编号
-  2. video_path 含路径关键词 (如 0463) → 取对应车型编号
-  3. 都不命中 → 默认 0452
+  1. summary 含 title_keywords 的 key → 取对应 value
+  2. video_path 含 path_keywords 的 key → 取对应 value
+  3. 都不命中 → default
 """
 
-from typing import Optional
+from typing import Optional, Dict, Any
+
+from ..config import load_data_proc_car_keywords
 
 
-# 标题关键词 → 车型编号 (summary 中出现 "463车" 等即匹配)
-CAR_KEYWORDS = ["463车", "508车", "3545车", "3554车", "3637车", "5436车", "5463车"]
+# 模块级缓存 (首次调用 classify 时加载, 避免每条素材都读 yaml)
+_CFG: Optional[Dict[str, Any]] = None
 
-# 路径关键词 → 车型编号 (video_path 中出现 0463 等即匹配)
-PATH_KEYWORDS = {
-    "0463": "463",
-    "0508": "508",
-    "3545": "3545",
-    "3554": "3554",
-    "3637": "3637",
-    "5436": "5463",
-    "5463": "5463",
-}
 
-# 默认车型 (匹配不到时)
-DEFAULT_CATEGORY = "0452"
+def _get_cfg() -> Dict[str, Any]:
+    global _CFG
+    if _CFG is None:
+        _CFG = load_data_proc_car_keywords()
+    return _CFG
 
 
 def classify(summary: Optional[str], video_path: Optional[str]) -> str:
@@ -39,14 +38,16 @@ def classify(summary: Optional[str], video_path: Optional[str]) -> str:
     Returns:
         车型编号字符串 (如 "463", "0452")
     """
+    cfg = _get_cfg()
+
     if summary:
-        for keyword in CAR_KEYWORDS:
+        for keyword, category in cfg["title_keywords"].items():
             if keyword in summary:
-                return keyword.replace("车", "")
+                return str(category)
 
     if video_path:
-        for path_key, category in PATH_KEYWORDS.items():
+        for path_key, category in cfg["path_keywords"].items():
             if path_key in video_path:
-                return category
+                return str(category)
 
-    return DEFAULT_CATEGORY
+    return str(cfg["default"])

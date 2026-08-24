@@ -180,6 +180,31 @@ car_keywords:
   '0508': geely_0508
   '5463': geely_5463
   '3637': geely_3637
+
+# 数据处理车型映射 (data_preproc/classifier.py 使用)
+# title_keywords: Jira 标题匹配 (summary 含 key → 取 value 车型编号)
+# path_keywords:  视频路径匹配 (path 含 key → 取 value 车型编号)
+# default:        都不命中时的兜底车型
+data_proc_car_keywords:
+  title_keywords:
+    "463车": "463"
+    "508车": "508"
+    "3545车": "3545"
+    "3554车": "3554"
+    "3637车": "3637"
+    "5436车": "5463"
+    "5463车": "5463"
+    "1604车": "1604"
+  path_keywords:
+    "0463": "463"
+    "0508": "508"
+    "3545": "3545"
+    "3554": "3554"
+    "3637": "3637"
+    "5436": "5463"
+    "5463": "5463"
+    "1604": "1604"
+  default: "0452"
 replay_list_template: |
   #!/bin/sh
   app_path={{APP_PATH}}

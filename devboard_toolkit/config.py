@@ -75,6 +75,19 @@ DEFAULT_ADAS: Dict[str, Any] = {
     "max_workers": 4,
 }
 
+# 内置默认数据处理车型映射(兜底, config.yaml 缺失时用)
+DEFAULT_DATA_PROC_CAR: Dict[str, Any] = {
+    "title_keywords": {
+        "463车": "463", "508车": "508", "3545车": "3545",
+        "3554车": "3554", "3637车": "3637", "5436车": "5463", "5463车": "5463",
+    },
+    "path_keywords": {
+        "0463": "463", "0508": "508", "3545": "3545",
+        "3554": "3554", "3637": "3637", "5436": "5463", "5463": "5463",
+    },
+    "default": "0452",
+}
+
 
 def _merge(a: Dict, b: Dict) -> Dict:
     """同 key 的配置用 b 覆盖 a"""
@@ -199,6 +212,29 @@ def load_car_models() -> Dict[str, str]:
     """加载车型-标定名称映射"""
     yaml_data = _load_yaml(_yaml_path())
     return dict(yaml_data.get("car_models", {}))
+
+
+def load_data_proc_car_keywords() -> Dict[str, Any]:
+    """加载数据处理车型映射 (title_keywords / path_keywords / default)
+
+    优先级: 内置 DEFAULT_DATA_PROC_CAR (兜底) → config.yaml 的 data_proc_car_keywords 段
+    (段内存在的子项整体替换对应默认子项, 不存在的子项保持默认)
+    """
+    cfg = {
+        "title_keywords": dict(DEFAULT_DATA_PROC_CAR["title_keywords"]),
+        "path_keywords": dict(DEFAULT_DATA_PROC_CAR["path_keywords"]),
+        "default": DEFAULT_DATA_PROC_CAR["default"],
+    }
+    yaml_data = _load_yaml(_yaml_path())
+    user = yaml_data.get("data_proc_car_keywords", {})
+    if isinstance(user, dict):
+        if "title_keywords" in user and isinstance(user["title_keywords"], dict):
+            cfg["title_keywords"] = dict(user["title_keywords"])
+        if "path_keywords" in user and isinstance(user["path_keywords"], dict):
+            cfg["path_keywords"] = dict(user["path_keywords"])
+        if "default" in user and user["default"]:
+            cfg["default"] = str(user["default"])
+    return cfg
 
 
 def load_replay_list_template() -> str:
