@@ -116,13 +116,20 @@ def _write_version_file(git_hash):
     print(f"  [+] 已写入: {ver_path}")
 
 
-def _copy_yamls_to_dist():
-    """把项目根目录的 config_user.yaml / config_system.yaml 复制到 dist/
-    不存在则尝试从旧 config.yaml 拆分 (仅复制已存在的, 不创建新的)
+def _copy_yamls_to_dist(include_user: bool = False, include_system: bool = False):
+    """根据发布参数, 把指定 yaml 从项目根目录复制到 dist/
+
+    Args:
+        include_user:   是否复制 config_user.yaml (用户配置)
+        include_system: 是否复制 config_system.yaml (系统配置)
     """
     import shutil
     os.makedirs(_DIST_DIR, exist_ok=True)
-    for yname in (_USER_YAML, _SYSTEM_YAML):
+    flags = {_USER_YAML: include_user, _SYSTEM_YAML: include_system}
+    for yname, enabled in flags.items():
+        if not enabled:
+            print(f"  [-] 未勾选包含 {yname}, 跳过")
+            continue
         src = os.path.join(_PROJECT_ROOT, yname)
         dst = os.path.join(_DIST_DIR, yname)
         if os.path.isfile(src):
@@ -226,6 +233,10 @@ def main():
                         help="创建为草稿 (不公开)")
     parser.add_argument("--skip-build", action="store_true",
                         help="跳过 PyInstaller (已有 dist/ 产物时)")
+    parser.add_argument("--include-user-yaml", action="store_true",
+                        help=f"发布时包含 {_USER_YAML} (用户端会自动覆盖该文件, 慎用!)")
+    parser.add_argument("--include-system-yaml", action="store_true",
+                        help=f"发布时包含 {_SYSTEM_YAML} (用户端会自动覆盖该文件)")
     args = parser.parse_args()
 
     # notes 解析: --notes-file 优先于 --notes
@@ -242,6 +253,9 @@ def main():
     print("=" * 60)
     print("  DevBoard Toolkit — Build & Release")
     print("=" * 60)
+    print(f"  包含 {_USER_YAML}:    {'是 (会覆盖用户本地, 慎用)' if args.include_user_yaml else '否'}")
+    print(f"  包含 {_SYSTEM_YAML}:  {'是' if args.include_system_yaml else '否'}")
+    print("=" * 60)
 
     # --build-only: 只打包, 不 git 也不发布
     if args.build_only:
@@ -249,7 +263,10 @@ def main():
             _build_exe()
         git_hash = _get_git_hash()
         _write_version_file(git_hash)
-        _copy_yamls_to_dist()
+        _copy_yamls_to_dist(
+            include_user=args.include_user_yaml,
+            include_system=args.include_system_yaml,
+        )
         print(f"\n  exe 在: {_DIST_DIR}")
         print(f"  版本号: {git_hash}")
         return 0
@@ -289,9 +306,12 @@ def main():
     else:
         print("\n[3] 跳过打包 (--skip-build)")
 
-    # 5. 注入版本号 (dist/) + 复制 yaml
+    # 5. 注入版本号 (dist/) + 复制 yaml(按参数决定)
     _write_version_file(git_hash)
-    _copy_yamls_to_dist()
+    _copy_yamls_to_dist(
+        include_user=args.include_user_yaml,
+        include_system=args.include_system_yaml,
+    )
 
     # 6. 发布
     ok = _create_release(git_hash, notes=notes, draft=args.draft)

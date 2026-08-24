@@ -3844,109 +3844,24 @@ class App(tk.Tk):
 
     def _prompt_update(self, remote_hash: str, commit_msg: str,
                        release_tag: str = ""):
-        """弹窗提示用户是否更新 (带 yaml 更新复选框)
+        """弹窗提示用户是否更新 (配置文件由发布端决定, 用户端无需选择)"""
+        msg = (f"发现新版本\n\n"
+               f"当前版本: {self._read_local_version()[:8]}\n"
+               f"最新版本: {remote_hash[:8]}\n"
+               f"更新内容: {commit_msg}\n\n"
+               f"必更新: devboard_toolkit.exe, per_board_runner.exe, _version.txt\n"
+               f"配置文件: 随版本自动同步 (发布端已决定包含哪些)\n\n"
+               f"是否立即下载并更新？")
+        rc = messagebox.askyesno("自动更新", msg, default="yes")
+        if rc:
+            self._do_update(remote_hash, release_tag)
 
-        返回用户选择: (是否更新, 是否更新用户yaml, 是否更新系统yaml)
-        """
-        dlg = tk.Toplevel(self)
-        dlg.title("自动更新")
-        dlg.geometry("460x360")
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.grab_set()
+    def _do_update(self, remote_hash: str, release_tag: str = ""):
+        """下载新 exe + runner + _version.txt + 检测两个 yaml (Release有就下,没有就跳过)
+        → 写 .bat 替换脚本 + 重启
 
-        # 居中
-        self.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - 460) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - 360) // 2
-        dlg.geometry(f"+{x}+{y}")
-
-        ttk.Label(dlg, text="发现新版本",
-                  style="SubTitle.TLabel").pack(pady=(16, 8))
-
-        # 版本信息
-        info_frame = ttk.Frame(dlg)
-        info_frame.pack(fill="x", padx=24, pady=4)
-        ttk.Label(info_frame, text=f"当前版本: {self._read_local_version()[:8]}",
-                  style="Hint.TLabel").pack(anchor="w")
-        ttk.Label(info_frame, text=f"最新版本: {remote_hash[:8]}",
-                  style="Hint.TLabel").pack(anchor="w")
-        ttk.Label(info_frame, text=f"更新内容: {commit_msg[:60]}",
-                  style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
-
-        ttk.Separator(dlg).pack(fill="x", padx=20, pady=12)
-
-        # 必更新项提示
-        ttk.Label(dlg, text="必更新: devboard_toolkit.exe, per_board_runner.exe, _version.txt",
-                  style="Hint.TLabel").pack(anchor="w", padx=24)
-
-        ttk.Label(dlg, text="可选更新 (配置文件, 不勾选则保留当前配置):",
-                  style="Hint.TLabel").pack(anchor="w", padx=24, pady=(12, 4))
-
-        # YAML 复选框
-        chk_frame = ttk.Frame(dlg)
-        chk_frame.pack(fill="x", padx=28, pady=2)
-
-        update_user_yaml = tk.BooleanVar(value=False)
-        update_system_yaml = tk.BooleanVar(value=True)
-        # 根据本地情况判断: 若用户已有 config_user.yaml, 默认不更新以保护用户配置
-        try:
-            import os, sys
-            exe_dir = os.path.dirname(sys.executable)
-            if os.path.isfile(os.path.join(exe_dir, self._USER_YAML)):
-                update_user_yaml.set(False)
-            if os.path.isfile(os.path.join(exe_dir, self._SYSTEM_YAML)):
-                update_system_yaml.set(True)
-        except Exception:
-            pass
-
-        ttk.Checkbutton(
-            chk_frame, text=f"更新 {self._USER_YAML} (用户配置: boards/账号/车型等, 会覆盖当前)",
-            variable=update_user_yaml,
-        ).pack(anchor="w", pady=2)
-        ttk.Checkbutton(
-            chk_frame, text=f"更新 {self._SYSTEM_YAML} (系统配置: 回灌模板/阈值等, 推荐更新)",
-            variable=update_system_yaml,
-        ).pack(anchor="w", pady=2)
-
-        ttk.Separator(dlg).pack(fill="x", padx=20, pady=12)
-
-        # 按钮
-        btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(fill="x", padx=24, pady=(0, 12))
-
-        result = {"do_update": False}
-
-        def _on_no():
-            result["do_update"] = False
-            dlg.destroy()
-
-        def _on_yes():
-            result["do_update"] = True
-            result["update_user_yaml"] = update_user_yaml.get()
-            result["update_system_yaml"] = update_system_yaml.get()
-            dlg.destroy()
-
-        ttk.Button(btn_frame, text="暂不更新", style="Ghost.TButton",
-                   command=_on_no).pack(side="right", padx=(8, 0))
-        ttk.Button(btn_frame, text="立即更新", command=_on_yes).pack(side="right")
-
-        self.wait_window(dlg)
-
-        if result.get("do_update"):
-            self._do_update(
-                remote_hash, release_tag,
-                update_user_yaml=result.get("update_user_yaml", False),
-                update_system_yaml=result.get("update_system_yaml", True),
-            )
-
-    def _do_update(self, remote_hash: str, release_tag: str = "",
-                   update_user_yaml: bool = False, update_system_yaml: bool = True):
-        """下载新 exe + runner + _version.txt + (可选) yaml → 写 .bat 替换脚本 + 重启
-
-        Args:
-            update_user_yaml:   是否下载并替换 config_user.yaml
-            update_system_yaml: 是否下载并替换 config_system.yaml
+        yaml 策略: 两个都尝试从 Release assets 下载, 发布端没包含 (404) 就静默跳过,
+        不影响主流程; 下载到了就替换本地同名文件 (由发布端决定是否发布 yaml, 用户端无选择权)。
         """
         import urllib.request
         import urllib.error
@@ -3961,8 +3876,8 @@ class App(tk.Tk):
         exe_url = f"{base_dl}/{self._EXE_NAME}"
         runner_url = f"{base_dl}/{self._RUNNER_NAME}"
         ver_url = f"{base_dl}/_version.txt"
-        user_yaml_url = f"{base_dl}/{self._USER_YAML}" if update_user_yaml else ""
-        system_yaml_url = f"{base_dl}/{self._SYSTEM_YAML}" if update_system_yaml else ""
+        user_yaml_url = f"{base_dl}/{self._USER_YAML}"
+        system_yaml_url = f"{base_dl}/{self._SYSTEM_YAML}"
 
         # 2. 弹出下载进度窗口
         dl_win = tk.Toplevel(self)
@@ -3985,29 +3900,77 @@ class App(tk.Tk):
                   style="Hint.TLabel").pack(pady=(0, 4))
 
         def _download_file(url: str, tmp_path: str, timeout: int = 60,
-                           show_progress: bool = True) -> None:
-            """下载单个文件, show_progress=False 时仅更新文字"""
+                           show_progress: bool = True, silent_missing: bool = False) -> bool:
+            """下载单个文件
+
+            Args:
+                show_progress:  是否刷新进度条百分比
+                silent_missing: True 时 HTTP 404/URL 不存在 返回 False, 不抛异常
+                                (用于 yaml: 发布端不包含时静默跳过)
+
+            Returns:
+                True 下载成功, False 缺失文件 (仅 silent_missing=True 时会 False)
+            """
             req = urllib.request.Request(url, headers={
                 "User-Agent": "devboard-toolkit-updater",
             })
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                total = int(resp.headers.get("Content-Length", 0)) if show_progress else 0
-                if show_progress and total > 0:
-                    prog.configure(maximum=total, value=0)
-                downloaded = 0
-                with open(tmp_path, "wb") as out:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        downloaded += len(chunk)
-                        if show_progress and total > 0:
-                            pct = int(downloaded / total * 100)
-                            self.after(0, lambda p=pct: (
-                                prog.configure(value=downloaded),
-                                pct_var.set(f"下载中 {p}%")
-                            ))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    total = int(resp.headers.get("Content-Length", 0)) if show_progress else 0
+                    if show_progress and total > 0:
+                        prog.configure(maximum=total, value=0)
+                    downloaded = 0
+                    with open(tmp_path, "wb") as out:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            downloaded += len(chunk)
+                            if show_progress and total > 0:
+                                pct = int(downloaded / total * 100)
+                                self.after(0, lambda p=pct: (
+                                    prog.configure(value=downloaded),
+                                    pct_var.set(f"下载中 {p}%")
+                                ))
+                return True
+            except urllib.error.HTTPError as he:
+                if silent_missing and he.code in (404,):
+                    return False
+                raise
+            except urllib.error.URLError as ue:
+                # 某些代理/CDN 会用 URLError 包装 NotFound
+                if silent_missing and ("404" in str(ue) or "Not Found" in str(ue)):
+                    return False
+                raise
+
+        def _try_download_yaml(url: str, tmp_path: str, label: str) -> str:
+            """尝试下载 yaml, 成功返回 tmp_path, 失败返回 "" (静默)"""
+            self.after(0, lambda: (
+                detail_var.set(label),
+                pct_var.set("检测中...")
+            ))
+            try:
+                ok = _download_file(url, tmp_path, timeout=20,
+                                    show_progress=False, silent_missing=True)
+                if ok:
+                    print(f"[更新] {label}: Release 包含, 已下载", flush=True)
+                    return tmp_path
+                print(f"[更新] {label}: Release 未包含 (跳过)", flush=True)
+                try:
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return ""
+            except Exception as ye:
+                print(f"[更新] {label}: 下载异常(跳过): {ye}", flush=True)
+                try:
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return ""
 
         def _download_thread():
             try:
@@ -4015,21 +3978,21 @@ class App(tk.Tk):
                 tmp_exe = os.path.join(tmp_dir, f"{self._EXE_NAME}.new")
                 tmp_runner = os.path.join(tmp_dir, f"{self._RUNNER_NAME}.new")
                 tmp_ver = os.path.join(tmp_dir, "_version.new.txt")
-                tmp_user_yaml = os.path.join(tmp_dir, f"{self._USER_YAML}.new") if update_user_yaml else ""
-                tmp_system_yaml = os.path.join(tmp_dir, f"{self._SYSTEM_YAML}.new") if update_system_yaml else ""
+                tmp_user_yaml = os.path.join(tmp_dir, f"{self._USER_YAML}.new")
+                tmp_system_yaml = os.path.join(tmp_dir, f"{self._SYSTEM_YAML}.new")
 
-                # 1) 下载主 exe
+                # 1) 必更新: 主 exe
                 self.after(0, lambda: detail_var.set(f"主程序: {self._EXE_NAME}"))
                 _download_file(exe_url, tmp_exe, timeout=120, show_progress=True)
 
-                # 2) 下载 runner exe
+                # 2) 必更新: runner exe
                 self.after(0, lambda: (
                     detail_var.set(f"板端脚本: {self._RUNNER_NAME}"),
                     pct_var.set("下载中...")
                 ))
                 _download_file(runner_url, tmp_runner, timeout=120, show_progress=False)
 
-                # 3) 下载 _version.txt
+                # 3) 必更新: _version.txt
                 new_hash = remote_hash
                 self.after(0, lambda: (
                     detail_var.set("版本信息: _version.txt"),
@@ -4043,29 +4006,17 @@ class App(tk.Tk):
                 with open(tmp_ver, "w", encoding="utf-8") as vf:
                     vf.write(new_hash)
 
-                # 4) 可选: 下载 config_user.yaml (缺文件不报错)
-                if update_user_yaml:
-                    try:
-                        self.after(0, lambda: (
-                            detail_var.set(f"用户配置: {self._USER_YAML}"),
-                            pct_var.set("下载中...")
-                        ))
-                        _download_file(user_yaml_url, tmp_user_yaml, timeout=20, show_progress=False)
-                    except Exception as ye:
-                        print(f"[更新] 下载 {self._USER_YAML} 失败(忽略): {ye}", flush=True)
-                        tmp_user_yaml = ""
+                # 4) 检测并下载 config_user.yaml (Release 有就下载, 没有或失败就 tmp_user_yaml="")
+                final_user_yaml = _try_download_yaml(
+                    user_yaml_url, tmp_user_yaml,
+                    label=f"用户配置: {self._USER_YAML}",
+                )
 
-                # 5) 可选: 下载 config_system.yaml (缺文件不报错)
-                if update_system_yaml:
-                    try:
-                        self.after(0, lambda: (
-                            detail_var.set(f"系统配置: {self._SYSTEM_YAML}"),
-                            pct_var.set("下载中...")
-                        ))
-                        _download_file(system_yaml_url, tmp_system_yaml, timeout=20, show_progress=False)
-                    except Exception as ye:
-                        print(f"[更新] 下载 {self._SYSTEM_YAML} 失败(忽略): {ye}", flush=True)
-                        tmp_system_yaml = ""
+                # 5) 检测并下载 config_system.yaml (Release 有就下载, 没有或失败就 tmp_system_yaml="")
+                final_system_yaml = _try_download_yaml(
+                    system_yaml_url, tmp_system_yaml,
+                    label=f"系统配置: {self._SYSTEM_YAML}",
+                )
 
                 # 下载完成 → 写 .bat 替换脚本
                 self.after(0, lambda: (
@@ -4073,8 +4024,8 @@ class App(tk.Tk):
                     detail_var.set("")
                 ))
                 self.after(0, lambda: self._swap_and_restart(
-                    tmp_exe, tmp_runner, tmp_ver if ver_url else None,
-                    tmp_user_yaml, tmp_system_yaml,
+                    tmp_exe, tmp_runner, tmp_ver,
+                    final_user_yaml, final_system_yaml,
                     new_hash, dl_win))
             except Exception as e:
                 self.after(0, lambda: (
