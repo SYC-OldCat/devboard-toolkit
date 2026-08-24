@@ -779,6 +779,8 @@ class TabFeedback(ttk.Frame):
         self.board_spin = ttk.Spinbox(row_board, from_=1, to=6,
                                        textvariable=self.board_count, width=5)
         self.board_spin.pack(side="left")
+        # 标记用户是否主动点了"检测空闲板" (用于区分: 检测后用户选了板数 vs 未检测直接启动)
+        self._user_detected = False
         ttk.Button(row_board, text="\U0001f50d 检测空闲板", style="Ghost.TButton",
                    command=self._on_detect_boards).pack(side="left", padx=(8, 0))
         self.use_online_var = tk.BooleanVar(value=False)
@@ -1212,6 +1214,8 @@ class TabFeedback(ttk.Frame):
             if idle:
                 n_idle = len(idle)
                 self.after(0, lambda: self._update_board_spin(n_idle))
+                # 标记用户已主动检测, 启动时尊重用户的 Spinbox 选择, 不再覆盖
+                self._user_detected = True
                 print(f"\n[+] 检测到 {n_idle} 块空闲板: {', '.join(idle)}")
             else:
                 print("\n[!] 没有空闲开发板")
@@ -1414,11 +1418,6 @@ class TabFeedback(ttk.Frame):
                 for _bn in idle_init:
                     self._board_first_run[_bn] = True
                 _idle_n = len(idle_init)
-                # 更新 GUI Spinbox 上限
-                try:
-                    self._update_board_spin(_idle_n)
-                except Exception:
-                    pass
                 print(f"  [*] 启动前检测到 {_idle_n} 块空闲板: {', '.join(idle_init)}")
             else:
                 print("  [!] 启动前未检测到空闲板 (后续增量检测会补充)")
@@ -1426,17 +1425,25 @@ class TabFeedback(ttk.Frame):
             print(f"  [!] 启动前板检测异常: {_e}")
             idle_init = []
 
-        # 修正 ctx["n"]: 跟随空闲板数自动调整
-        # - 默认值 1: 上调到实际空闲板数 (避免检测到多块板却只用 1 块拖累回灌)
-        # - 用户主动设置 (>1): 只下调不超过空闲板数, 保留用户上限语义
+        # 修正 ctx["n"]:
+        # - 用户主动点了"检测空闲板" (_user_detected=True): 尊重用户 Spinbox 选择, 仅下调不超过空闲板数
+        # - 未检测直接启动 (_user_detected=False): 按检测到的空闲板数全用 (ctx["n"]=_idle_n), 并更新 Spinbox
         if _idle_n > 0:
             _orig_n = ctx["n"]
-            if _orig_n <= 1:
-                ctx["n"] = _idle_n
-            else:
+            if getattr(self, "_user_detected", False):
+                # 用户已检测过: 尊重用户值, 只下调
                 ctx["n"] = min(_orig_n, _idle_n)
-            if ctx["n"] != _orig_n:
-                print(f"  [i] 板数自动调整: {_orig_n} → {ctx['n']} (跟随空闲板数 {_idle_n})")
+                if ctx["n"] != _orig_n:
+                    print(f"  [i] 板数下调: {_orig_n} → {ctx['n']} (用户选择超出空闲板数 {_idle_n})")
+            else:
+                # 未检测直接启动: 用全部空闲板, 更新 Spinbox 显示
+                ctx["n"] = _idle_n
+                try:
+                    self._update_board_spin(_idle_n)
+                except Exception:
+                    pass
+                if ctx["n"] != _orig_n:
+                    print(f"  [i] 板数自动调整: {_orig_n} → {ctx['n']} (未检测, 用全部空闲板 {_idle_n})")
         if ctx["n"] < 1:
             # 没检测到板但用户填了,给一个至少为 1 的安全下限,下游会再次根据空闲池微调
             ctx["n"] = max(ctx["n"], 1)
@@ -1449,18 +1456,29 @@ class TabFeedback(ttk.Frame):
                 import shutil
                 tool_dir = _project_tool_dir()
                 fcf_src = os.path.join(tool_dir, "fcf_calibration", fcf_ver)
-                if os.path.isdir(fcf_src):
-                    for fname in ("vehConfig.json", "vruConfig.json"):
-                        src_f = os.path.join(fcf_src, fname)
-                        dst_f = os.path.join(unc_replay_folder, fname)
-                        if os.path.isfile(src_f):
-                            shutil.copy2(src_f, dst_f)
-                            print(f"[*] fcf标定覆盖: {fname} ← {fcf_ver}")
-                    print(f"[+] fcf标定已覆盖为 {fcf_ver}")
-                else:
-                    print(f"[!] fcf标定版本目录不存在: {fcf_src}, 跳过覆盖")
+                if not os.path.isdir(fcf_src):
+                    print(f"[!] ERROR: fcf标定版本目录不存在: {fcf_src}")
+                    print(f"[!] 回灌中止 (避免用错误标定)")
+                    return 2
+                # 校验两个标定文件都存在
+                missing = []
+                for fname in ("vehConfig.json", "vruConfig.json"):
+                    if not os.path.isfile(os.path.join(fcf_src, fname)):
+                        missing.append(fname)
+                if missing:
+                    print(f"[!] ERROR: fcf标定文件缺失: {', '.join(missing)} (目录: {fcf_src})")
+                    print(f"[!] 回灌中止 (避免混用新旧标定)")
+                    return 2
+                # 全部存在 → 强制覆盖到回灌目录
+                for fname in ("vehConfig.json", "vruConfig.json"):
+                    src_f = os.path.join(fcf_src, fname)
+                    dst_f = os.path.join(unc_replay_folder, fname)
+                    shutil.copy2(src_f, dst_f)
+                    print(f"[*] fcf标定覆盖: {fname} ← {fcf_ver}")
+                print(f"[+] fcf标定已覆盖为 {fcf_ver}")
             except Exception as e:
                 print(f"[!] fcf标定覆盖失败: {e}")
+                return 2
         else:
             print(f"[*] fcf标定: default (不覆盖)")
 
