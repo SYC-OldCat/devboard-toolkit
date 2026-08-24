@@ -1525,10 +1525,14 @@ class TabFeedback(ttk.Frame):
 
             # ==== Step B: 流水线式 txt 回灌 (自适应切分 + 动态调度 + 增量检测) ====
             BOARD_RESCAN_INTERVAL = 60  # 增量检测间隔: 1 分钟
+            POLL_INTERVAL = 5           # 主轮询短间隔: 5s (板完成/新板上线快速响应)
+
+            # 初始化增量扫描时间戳: 避免首次进入循环立即触发扫描 (此时板刚被分配, reboot 中会被误判为忙)
+            self._shared_last_rescan = time.time()
 
             print(f"\n{'=' * 60}")
             print(f"  [B] 回灌队列表 (共 {len(sorted_txts)} 个 txt, 流水线模式)")
-            print(f"  [B] 增量检测空闲板: 每 {BOARD_RESCAN_INTERVAL}s 一次")
+            print(f"  [B] 增量检测空闲板: 每 {BOARD_RESCAN_INTERVAL}s 一次 (主轮询 {POLL_INTERVAL}s)")
             print(f"{'=' * 60}")
             for i, tp in enumerate(sorted_txts, 1):
                 try:
@@ -1537,16 +1541,20 @@ class TabFeedback(ttk.Frame):
                     n_line = 0
                 print(f"  {i}. {os.path.basename(tp)}  ({n_line} 条)")
 
-            # 初始检测空闲板 (排除已被其他任务占用的板)
-            print(f"\n[*] 检测空闲板 (排除已被其他任务占用的板)...")
-            idle = self._sync_detect_boards(stop_event, exclude_busy=True)
-            if stop_event.is_set():
-                return 2
-            if not idle:
-                print("[!] 没有空闲板, 结束回灌")
-                return 1
-            self._pool_add(idle)
-            print(f"[+] 检测到 {len(idle)} 块空闲板, 已加入共享板池 (当前池大小: {self._pool_size()})")
+            # 板资源复用: _do_start_task 开头已做过启动前检测并加入共享池, 这里不再重复扫描
+            # 只有共享池为空时才降级做一次检测 (避免前面的检测因为 board3 慢而漏板)
+            if self._pool_size() == 0:
+                print(f"\n[*] 共享板池为空, 补充检测空闲板...")
+                idle = self._sync_detect_boards(stop_event, exclude_busy=True)
+                if stop_event.is_set():
+                    return 2
+                if not idle:
+                    print("[!] 没有空闲板, 结束回灌")
+                    return 1
+                self._pool_add(idle)
+                print(f"[+] 检测到 {len(idle)} 块空闲板, 已加入共享板池 (当前池大小: {self._pool_size()})")
+            else:
+                print(f"\n[*] 复用共享板池 ({self._pool_size()} 块空闲板, 跳过重复检测)")
 
             os.makedirs(log_dir, exist_ok=True)
 
@@ -1918,6 +1926,9 @@ class TabFeedback(ttk.Frame):
 
                 # 回收无接力任务的完成板到空闲池
                 self._pool_return_batch(completed_boards_pool)
+                # 有板释放 → 立刻触发下一轮增量扫描 (可能有其他板也刚跑完, 一起加入池)
+                if completed_boards_pool:
+                    self._shared_last_rescan = time.time() - BOARD_RESCAN_INTERVAL
 
                 # 3. 有空闲板且有待回灌 txt → 启动 (动态阈值判断)
                 while self._pool_size() > 0 and queue:
@@ -1951,41 +1962,43 @@ class TabFeedback(ttk.Frame):
 
                     next_txt = queue.pop(0)
 
-                    # === 每个新 txt 启动前重新检测空闲板 (增量检测, 不阻塞) ===
-                    try:
-                        from concurrent.futures import ThreadPoolExecutor, as_completed
-                        from devboard_toolkit.config import load_boards
-                        from devboard_toolkit.usage_check import check_usage_one
+                    # === [txt前检测]: 只有空闲池为空/不足时才扫描未使用板, 否则跳过 (避免重复SSH耗时)
+                    need_xtra = (pool_size == 0 or pool_size < min(2, ctx["n"]))
+                    if need_xtra:
+                        try:
+                            from concurrent.futures import ThreadPoolExecutor, as_completed
+                            from devboard_toolkit.config import load_boards
+                            from devboard_toolkit.usage_check import check_usage_one
 
-                        all_boards_cfg = load_boards()
-                        use_online = bool(self.use_online_var.get())
-                        all_board_names = [n for n in all_boards_cfg.keys()
-                                           if use_online or not n.lower().startswith("online")]
-                        busy = self._busy_snapshot()
-                        pool = self._pool_snapshot()
-                        in_use = busy | set(pool)
-                        to_check = [n for n in all_board_names if n not in in_use]
-                        if to_check:
-                            print(f"\n  [txt前检测] 增量扫描 {len(to_check)} 块未使用板...")
-                            newly_idle = []
-                            with ThreadPoolExecutor(max_workers=len(to_check)) as ex:
-                                futs = {ex.submit(check_usage_one, n, all_boards_cfg[n]): n
-                                        for n in to_check}
-                                for fut in as_completed(futs):
-                                    if stop_event.is_set():
-                                        break
-                                    r = fut.result()
-                                    if not r.busy:
-                                        newly_idle.append(r.name)
-                            if newly_idle:
-                                self._pool_add(newly_idle)
-                                for bn in newly_idle:
-                                    self._board_first_run[bn] = True
-                                print(f"  [txt前检测] 新增 {len(newly_idle)} 块空闲板: "
-                                      f"{', '.join(newly_idle)} (当前池: {self._pool_size()})")
-                                pool_size = self._pool_size()
-                    except Exception as e:
-                        print(f"  [txt前检测] 增量检测异常: {e}")
+                            all_boards_cfg = load_boards()
+                            use_online = bool(self.use_online_var.get())
+                            all_board_names = [n for n in all_boards_cfg.keys()
+                                               if use_online or not n.lower().startswith("online")]
+                            busy = self._busy_snapshot()
+                            pool = self._pool_snapshot()
+                            in_use = busy | set(pool)
+                            to_check = [n for n in all_board_names if n not in in_use]
+                            if to_check:
+                                print(f"\n  [txt前检测] 池不足, 增量扫描 {len(to_check)} 块未使用板...")
+                                newly_idle = []
+                                with ThreadPoolExecutor(max_workers=len(to_check)) as ex:
+                                    futs = {ex.submit(check_usage_one, n, all_boards_cfg[n]): n
+                                            for n in to_check}
+                                    for fut in as_completed(futs):
+                                        if stop_event.is_set():
+                                            break
+                                        r = fut.result()
+                                        if not r.busy:
+                                            newly_idle.append(r.name)
+                                if newly_idle:
+                                    self._pool_add(newly_idle)
+                                    for bn in newly_idle:
+                                        self._board_first_run[bn] = True
+                                    print(f"  [txt前检测] 新增 {len(newly_idle)} 块空闲板: "
+                                          f"{', '.join(newly_idle)} (当前池: {self._pool_size()})")
+                                    pool_size = self._pool_size()
+                        except Exception as e:
+                            print(f"  [txt前检测] 增量检测异常: {e}")
 
                     try:
                         total_n = sum(1 for _ in open(next_txt, encoding="utf-8") if _.strip())
@@ -2051,10 +2064,10 @@ class TabFeedback(ttk.Frame):
                         cur_thr = 1 if not any_big else 2
                     print(f"    等待中... 空闲 {pool_size} 块, 进行中 {running_wait} 个 txt, "
                           f"{pending_desc} (阈值={cur_thr})")
-                    time.sleep(60)
+                    time.sleep(POLL_INTERVAL)
                 elif pending_wait > 0 and pool_size == 0:
                     print(f"    等待板空闲... {pending_desc}")
-                    time.sleep(60)
+                    time.sleep(POLL_INTERVAL)
                 elif pending_wait > 0 and pool_size > 0:
                     # 空闲板不够阈值且无在跑 → 下一轮循环会直接启动 (running_txts 为空阈值=1)
                     pass
