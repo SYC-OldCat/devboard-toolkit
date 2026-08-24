@@ -1,0 +1,205 @@
+# ============================================================
+# 用户配置 (config_user.yaml)
+# 随用户环境自定义，自动更新时默认不覆盖
+# 包含：开发板、挂载、回灌环境、车型、分类关键词、Jenkins、Jira、ADAS、路径
+# ============================================================
+boards:
+  board1:
+    host: 172.17.188.122
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  board2:
+    host: 172.17.188.189
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  board3:
+    host: 172.17.188.241
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  board4:
+    host: 172.17.188.71
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 15
+  board5:
+    host: 172.17.189.31
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  board6:
+    host: 172.17.189.36
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  Online1:
+    host: 172.17.188.246
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  Online2:
+    host: 172.17.188.248
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  Online3:
+    host: 172.17.189.1
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  Online4:
+    host: 172.17.188.247
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  Online5:
+    host: 172.17.189.12
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  Online6:
+    host: 172.17.189.13
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+  Online7:
+    host: 172.17.189.16
+    port: 22
+    user: root
+    password: arcsoft123
+    timeout: 8
+mount:
+  source: //172.17.12.118/Model_Test/TestSpace/Personal_Space
+  point: /mnt
+  username: syc53636
+  password: '@Ss19855468498'
+  domain: arcsoft-hz
+  testbed_subpath: /SYC/testbed
+replay_env:
+  mount_source: //172.17.12.118/Model_Test/TestSpace/Personal_Space
+  mount_point: /mnt
+  mount_options: username=syc53636,password=@Ss19855468498,domain=arcsoft-hz
+  testbed_subpath: /SYC/testbed
+  windows_host: hz-iotfs02
+car_models:
+  '0463': '0463'
+  '0508': '0508'
+  '3545': '3545'
+  '3554': '3554'
+  '3637': '3637'
+  '5436': '5436'
+  '5463': '5463'
+  '0452': calibration_result_2M_Fitting_Geely_0452
+  gl8: calibration_result_2M_Fitting_7078_20251114_k6
+  bl_0089: calibration_result_2M_Fitting_BL_M6_0089
+  bl_717: calibration_result_2M_Fitting_BL_717
+  lixiang1: calibration_result_2M_Fitting_4092_20251103_k6
+  lixiang2: calibration_result_2M_Fitting_0932_20251010_k6
+  lixiang3: calibration_result_2M_Fitting_1815_20251015
+  natie2: calibration_result_2M_Fitting_natie2_20251010
+  natie3: calibration_result_2M_Fitting_natie3_20251028
+  lynkco: calibration_result_2M_Fitting_Lynkco03
+  8M: P20N-260807
+  geely_2239: calibration_result_2M_Fitting_Geely_2506
+  wuling_0240: calibration_result_2M_Fitting_wuling_0240
+  wuling_5577: calibration_result_2M_Fitting_wuling_5577
+  '5013': '5013'
+  '0463_1': '0463'
+  0452new: 0452new
+  '1604': '1604'
+
+# 车型关键词映射 (classify_by_car.py 使用)
+# key 出现在素材路径中即归为 value 对应的车型
+# 按 key 长度从长到短匹配, 防止短词抢命中
+car_keywords:
+  lixiang3: lixiang3
+  lixiang2: lixiang2
+  lixiang1: lixiang1
+  lx3: lixiang3
+  lx2: lixiang2
+  lx1: lixiang1
+  lixinag1: lixiang1
+  lixinag2: lixiang2
+  natie3: natie3
+  natie2: natie2
+  nt3: natie3
+  nt2: natie2
+  none: '5013'
+  Wuling_5577: wuling_5577
+  Wuling_5741: wuling_5741
+  wuling_5577: wuling_5577
+  wuling_5741: wuling_5741
+  Wuling_0240: wuling_0240
+  wuling_0240: wuling_0240
+  wuling_5436: wuling_5436
+  wuling_3545: wuling_3545
+  wuling_3554: wuling_3554
+  wuling: wuling
+  lynkco: lynkco
+  lyncko: lynkco
+  Geely_2239: geely_2239
+  geely_2239: geely_2239
+  Geely_2506: geely_2506
+  geely_2506: geely_2506
+  Geely_0452: geely_0452
+  ss21_0452: geely_0452
+  geely_0452: geely_0452
+  geely_463: geely_463
+  geely_0463: geely_0463
+  geely_508: geely_0508
+  geely_1604: geely_1604
+  geely_0508: geely_0508
+  geely_5463: geely_5463
+  geely_3637: geely_3637
+  gl8: GL8
+  GL8: gl8
+  hq: HQ
+  hongqi: HQ
+  bl: BL
+  BL: BL
+  8M: 8M
+  '2239': geely_2239
+  '2506': geely_2506
+  '0452': geely_0452
+  '463': geely_463
+  '0463': geely_0463
+  '508': geely_0508
+  '1604': geely_1604
+  '0508': geely_0508
+  '5463': geely_5463
+  '3637': geely_3637
+
+jenkins:
+  server: http://172.17.189.18:8080
+  username: qatest
+  password: qatest
+  download_dir: \\hz-iotfs02\Model_Test\TestSpace\Personal_Space\SYC\testbed\pkgs
+  default_job: 25640-2_PDT_Perception_Testbed_V3.1.4_Linux_Lq560v200
+jira_data:
+  base_url: https://jira.arcsoft.com.cn:8443
+  test_url: https://jira.arcsoft.com.cn:8443/browse/ADAAFTI-1
+  username: syc53636
+  password: '@Ss19855468498'
+  max_workers: 5
+adas:
+  exe_path: D:/Desktop/adas/ADAS_Visualzation_v3.9.5_20260731/package/ADAS_Visualization.exe
+  verbose: 3
+  timeout: 300
+  max_workers: 4
+paths:
+  download_root: ''
+  output_root: ''

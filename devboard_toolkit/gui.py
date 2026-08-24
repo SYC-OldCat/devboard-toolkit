@@ -3699,6 +3699,9 @@ class App(tk.Tk):
     _GH_REPO = "devboard-toolkit"
     _GH_BRANCH = "master"
     _EXE_NAME = "devboard_toolkit.exe"
+    _RUNNER_NAME = "per_board_runner.exe"
+    _USER_YAML = "config_user.yaml"
+    _SYSTEM_YAML = "config_system.yaml"
 
     def __init__(self):
         super().__init__()
@@ -3841,18 +3844,110 @@ class App(tk.Tk):
 
     def _prompt_update(self, remote_hash: str, commit_msg: str,
                        release_tag: str = ""):
-        """弹窗提示用户是否更新"""
-        msg = (f"发现新版本\n\n"
-               f"当前版本: {self._read_local_version()[:8]}\n"
-               f"最新版本: {remote_hash[:8]}\n"
-               f"更新内容: {commit_msg}\n\n"
-               f"是否立即下载并更新？")
-        rc = messagebox.askyesno("自动更新", msg, default="yes")
-        if rc:
-            self._do_update(remote_hash, release_tag)
+        """弹窗提示用户是否更新 (带 yaml 更新复选框)
 
-    def _do_update(self, remote_hash: str, release_tag: str = ""):
-        """下载新 exe + _version.txt + 写 .bat 替换脚本 + 重启"""
+        返回用户选择: (是否更新, 是否更新用户yaml, 是否更新系统yaml)
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title("自动更新")
+        dlg.geometry("460x360")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        # 居中
+        self.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - 460) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 360) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+        ttk.Label(dlg, text="发现新版本",
+                  style="SubTitle.TLabel").pack(pady=(16, 8))
+
+        # 版本信息
+        info_frame = ttk.Frame(dlg)
+        info_frame.pack(fill="x", padx=24, pady=4)
+        ttk.Label(info_frame, text=f"当前版本: {self._read_local_version()[:8]}",
+                  style="Hint.TLabel").pack(anchor="w")
+        ttk.Label(info_frame, text=f"最新版本: {remote_hash[:8]}",
+                  style="Hint.TLabel").pack(anchor="w")
+        ttk.Label(info_frame, text=f"更新内容: {commit_msg[:60]}",
+                  style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
+
+        ttk.Separator(dlg).pack(fill="x", padx=20, pady=12)
+
+        # 必更新项提示
+        ttk.Label(dlg, text="必更新: devboard_toolkit.exe, per_board_runner.exe, _version.txt",
+                  style="Hint.TLabel").pack(anchor="w", padx=24)
+
+        ttk.Label(dlg, text="可选更新 (配置文件, 不勾选则保留当前配置):",
+                  style="Hint.TLabel").pack(anchor="w", padx=24, pady=(12, 4))
+
+        # YAML 复选框
+        chk_frame = ttk.Frame(dlg)
+        chk_frame.pack(fill="x", padx=28, pady=2)
+
+        update_user_yaml = tk.BooleanVar(value=False)
+        update_system_yaml = tk.BooleanVar(value=True)
+        # 根据本地情况判断: 若用户已有 config_user.yaml, 默认不更新以保护用户配置
+        try:
+            import os, sys
+            exe_dir = os.path.dirname(sys.executable)
+            if os.path.isfile(os.path.join(exe_dir, self._USER_YAML)):
+                update_user_yaml.set(False)
+            if os.path.isfile(os.path.join(exe_dir, self._SYSTEM_YAML)):
+                update_system_yaml.set(True)
+        except Exception:
+            pass
+
+        ttk.Checkbutton(
+            chk_frame, text=f"更新 {self._USER_YAML} (用户配置: boards/账号/车型等, 会覆盖当前)",
+            variable=update_user_yaml,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            chk_frame, text=f"更新 {self._SYSTEM_YAML} (系统配置: 回灌模板/阈值等, 推荐更新)",
+            variable=update_system_yaml,
+        ).pack(anchor="w", pady=2)
+
+        ttk.Separator(dlg).pack(fill="x", padx=20, pady=12)
+
+        # 按钮
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill="x", padx=24, pady=(0, 12))
+
+        result = {"do_update": False}
+
+        def _on_no():
+            result["do_update"] = False
+            dlg.destroy()
+
+        def _on_yes():
+            result["do_update"] = True
+            result["update_user_yaml"] = update_user_yaml.get()
+            result["update_system_yaml"] = update_system_yaml.get()
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="暂不更新", style="Ghost.TButton",
+                   command=_on_no).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_frame, text="立即更新", command=_on_yes).pack(side="right")
+
+        self.wait_window(dlg)
+
+        if result.get("do_update"):
+            self._do_update(
+                remote_hash, release_tag,
+                update_user_yaml=result.get("update_user_yaml", False),
+                update_system_yaml=result.get("update_system_yaml", True),
+            )
+
+    def _do_update(self, remote_hash: str, release_tag: str = "",
+                   update_user_yaml: bool = False, update_system_yaml: bool = True):
+        """下载新 exe + runner + _version.txt + (可选) yaml → 写 .bat 替换脚本 + 重启
+
+        Args:
+            update_user_yaml:   是否下载并替换 config_user.yaml
+            update_system_yaml: 是否下载并替换 config_system.yaml
+        """
         import urllib.request
         import urllib.error
         import tempfile
@@ -3864,12 +3959,15 @@ class App(tk.Tk):
         # 用 tag 直接构造下载 URL (无需 API, 无频率限制)
         base_dl = f"https://github.com/{self._GH_OWNER}/{self._GH_REPO}/releases/download/{release_tag}"
         exe_url = f"{base_dl}/{self._EXE_NAME}"
+        runner_url = f"{base_dl}/{self._RUNNER_NAME}"
         ver_url = f"{base_dl}/_version.txt"
+        user_yaml_url = f"{base_dl}/{self._USER_YAML}" if update_user_yaml else ""
+        system_yaml_url = f"{base_dl}/{self._SYSTEM_YAML}" if update_system_yaml else ""
 
         # 2. 弹出下载进度窗口
         dl_win = tk.Toplevel(self)
         dl_win.title("正在更新")
-        dl_win.geometry("420x160")
+        dl_win.geometry("440x200")
         dl_win.resizable(False, False)
         dl_win.transient(self)
         dl_win.grab_set()
@@ -3882,52 +3980,101 @@ class App(tk.Tk):
         pct_var = tk.StringVar(value="准备中...")
         ttk.Label(dl_win, textvariable=pct_var,
                   style="Hint.TLabel").pack(pady=4)
+        detail_var = tk.StringVar(value="")
+        ttk.Label(dl_win, textvariable=detail_var,
+                  style="Hint.TLabel").pack(pady=(0, 4))
+
+        def _download_file(url: str, tmp_path: str, timeout: int = 60,
+                           show_progress: bool = True) -> None:
+            """下载单个文件, show_progress=False 时仅更新文字"""
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "devboard-toolkit-updater",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                total = int(resp.headers.get("Content-Length", 0)) if show_progress else 0
+                if show_progress and total > 0:
+                    prog.configure(maximum=total, value=0)
+                downloaded = 0
+                with open(tmp_path, "wb") as out:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        downloaded += len(chunk)
+                        if show_progress and total > 0:
+                            pct = int(downloaded / total * 100)
+                            self.after(0, lambda p=pct: (
+                                prog.configure(value=downloaded),
+                                pct_var.set(f"下载中 {p}%")
+                            ))
 
         def _download_thread():
             try:
                 tmp_dir = tempfile.gettempdir()
                 tmp_exe = os.path.join(tmp_dir, f"{self._EXE_NAME}.new")
+                tmp_runner = os.path.join(tmp_dir, f"{self._RUNNER_NAME}.new")
                 tmp_ver = os.path.join(tmp_dir, "_version.new.txt")
+                tmp_user_yaml = os.path.join(tmp_dir, f"{self._USER_YAML}.new") if update_user_yaml else ""
+                tmp_system_yaml = os.path.join(tmp_dir, f"{self._SYSTEM_YAML}.new") if update_system_yaml else ""
 
-                # 下载 exe (大文件, 带进度)
-                req = urllib.request.Request(exe_url, headers={
+                # 1) 下载主 exe
+                self.after(0, lambda: detail_var.set(f"主程序: {self._EXE_NAME}"))
+                _download_file(exe_url, tmp_exe, timeout=120, show_progress=True)
+
+                # 2) 下载 runner exe
+                self.after(0, lambda: (
+                    detail_var.set(f"板端脚本: {self._RUNNER_NAME}"),
+                    pct_var.set("下载中...")
+                ))
+                _download_file(runner_url, tmp_runner, timeout=120, show_progress=False)
+
+                # 3) 下载 _version.txt
+                new_hash = remote_hash
+                self.after(0, lambda: (
+                    detail_var.set("版本信息: _version.txt"),
+                    pct_var.set("下载中...")
+                ))
+                req2 = urllib.request.Request(ver_url, headers={
                     "User-Agent": "devboard-toolkit-updater",
                 })
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    total = int(resp.headers.get("Content-Length", 0))
-                    if total > 0:
-                        prog.configure(maximum=total)
-                    downloaded = 0
-                    with open(tmp_exe, "wb") as out:
-                        while True:
-                            chunk = resp.read(65536)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                            downloaded += len(chunk)
-                            if total > 0:
-                                pct = int(downloaded / total * 100)
-                                self.after(0, lambda p=pct: (
-                                    prog.configure(value=p),
-                                    pct_var.set(f"下载中 {p}%")
-                                ))
+                with urllib.request.urlopen(req2, timeout=15) as resp2:
+                    new_hash = resp2.read().decode("utf-8").strip()
+                with open(tmp_ver, "w", encoding="utf-8") as vf:
+                    vf.write(new_hash)
 
-                # 下载 _version.txt (小文件)
-                new_hash = remote_hash
-                if ver_url:
-                    self.after(0, lambda: pct_var.set("下载版本信息..."))
-                    req2 = urllib.request.Request(ver_url, headers={
-                        "User-Agent": "devboard-toolkit-updater",
-                    })
-                    with urllib.request.urlopen(req2, timeout=15) as resp2:
-                        new_hash = resp2.read().decode("utf-8").strip()
-                    with open(tmp_ver, "w", encoding="utf-8") as vf:
-                        vf.write(new_hash)
+                # 4) 可选: 下载 config_user.yaml (缺文件不报错)
+                if update_user_yaml:
+                    try:
+                        self.after(0, lambda: (
+                            detail_var.set(f"用户配置: {self._USER_YAML}"),
+                            pct_var.set("下载中...")
+                        ))
+                        _download_file(user_yaml_url, tmp_user_yaml, timeout=20, show_progress=False)
+                    except Exception as ye:
+                        print(f"[更新] 下载 {self._USER_YAML} 失败(忽略): {ye}", flush=True)
+                        tmp_user_yaml = ""
+
+                # 5) 可选: 下载 config_system.yaml (缺文件不报错)
+                if update_system_yaml:
+                    try:
+                        self.after(0, lambda: (
+                            detail_var.set(f"系统配置: {self._SYSTEM_YAML}"),
+                            pct_var.set("下载中...")
+                        ))
+                        _download_file(system_yaml_url, tmp_system_yaml, timeout=20, show_progress=False)
+                    except Exception as ye:
+                        print(f"[更新] 下载 {self._SYSTEM_YAML} 失败(忽略): {ye}", flush=True)
+                        tmp_system_yaml = ""
 
                 # 下载完成 → 写 .bat 替换脚本
-                self.after(0, lambda: pct_var.set("准备替换..."))
+                self.after(0, lambda: (
+                    pct_var.set("准备替换..."),
+                    detail_var.set("")
+                ))
                 self.after(0, lambda: self._swap_and_restart(
-                    tmp_exe, tmp_ver if ver_url else None,
+                    tmp_exe, tmp_runner, tmp_ver if ver_url else None,
+                    tmp_user_yaml, tmp_system_yaml,
                     new_hash, dl_win))
             except Exception as e:
                 self.after(0, lambda: (
@@ -3937,29 +4084,34 @@ class App(tk.Tk):
 
         threading.Thread(target=_download_thread, daemon=True).start()
 
-    def _swap_and_restart(self, new_exe: str, new_ver: str,
+    def _swap_and_restart(self, new_exe: str, new_runner: str,
+                          new_ver: str, new_user_yaml: str, new_system_yaml: str,
                           new_hash: str, dl_win):
-        """生成 .bat 脚本: 等待退出→替换→重启 (explorer 等同双击, 最可靠)"""
+        """生成 .bat 脚本: 等待退出→替换所有文件→重启
+
+        必替换: devboard_toolkit.exe, per_board_runner.exe, _version.txt
+        可选替换: config_user.yaml (new_user_yaml 非空时), config_system.yaml (new_system_yaml 非空时)
+        """
         import tempfile
 
         dl_win.destroy()
 
         current_exe = sys.executable
         exe_dir = os.path.dirname(current_exe)
-        target_path = os.path.join(exe_dir, self._EXE_NAME)
-        version_path = os.path.join(exe_dir, "_version.txt")
+        target_exe = os.path.join(exe_dir, self._EXE_NAME)
+        target_runner = os.path.join(exe_dir, self._RUNNER_NAME)
+        target_ver = os.path.join(exe_dir, "_version.txt")
+        target_user_yaml = os.path.join(exe_dir, self._USER_YAML)
+        target_system_yaml = os.path.join(exe_dir, self._SYSTEM_YAML)
         current_pid = os.getpid()
         bat_path = os.path.join(tempfile.gettempdir(), "devboard_updater.bat")
         log_path = os.path.join(tempfile.gettempdir(), "devboard_updater.log")
 
-        # 关键: 用 explorer 启动新 exe (等同双击, 绕过 start 的各种坑)
-        # explorer 会用 Windows Shell 打开 .exe, 100% 可靠
         safe_log = log_path.replace('\\', '\\\\')
         bat_lines = [
             "@echo off",
             f'echo [{time.strftime("%H:%M:%S")}] 开始更新 > "{safe_log}"',
-            f'echo 目标: {target_path} >> "{log_path}"',
-            f'echo 新文件: {new_exe} >> "{log_path}"',
+            f'echo exe 目录: {exe_dir} >> "{log_path}"',
             "",
             ":wait",
             f'tasklist /FI "PID eq {current_pid}" 2>nul | find "{current_pid}" >nul',
@@ -3971,28 +4123,70 @@ class App(tk.Tk):
             "",
             "timeout /t 2 >nul",
             "",
-            f'echo 正在替换... >> "{log_path}"',
-            f'copy /Y "{new_exe}" "{target_path}" >> "{log_path}" 2>&1',
+            f'echo 正在替换文件... >> "{log_path}"',
+            "",
+            "rem === 必更新项: 主 exe ===",
+            f'copy /Y "{new_exe}" "{target_exe}" >> "{log_path}" 2>&1',
             "if %ERRORLEVEL% neq 0 (",
-            f'    echo [FAIL] 替换失败 >> "{log_path}"',
+            f'    echo [FAIL] 主 exe 替换失败 >> "{log_path}"',
             "    pause",
             "    exit /b 1",
             ")",
             f'del "{new_exe}" 2>nul',
+            "",
+            "rem === 必更新项: runner exe ===",
+            f'copy /Y "{new_runner}" "{target_runner}" >> "{log_path}" 2>&1',
+            "if %ERRORLEVEL% neq 0 (",
+            f'    echo [FAIL] runner exe 替换失败 >> "{log_path}"',
+            "    pause",
+            "    exit /b 1",
+            ")",
+            f'del "{new_runner}" 2>nul',
+            "",
+            "rem === 必更新项: _version.txt ===",
         ]
 
         if new_ver:
             bat_lines.extend([
-                f'copy /Y "{new_ver}" "{version_path}" >> "{log_path}" 2>&1',
+                f'copy /Y "{new_ver}" "{target_ver}" >> "{log_path}" 2>&1',
                 f'del "{new_ver}" 2>nul',
             ])
         else:
-            bat_lines.append(f'echo {new_hash}> "{version_path}"')
+            bat_lines.append(f'echo {new_hash}> "{target_ver}"')
+
+        # 可选: config_user.yaml
+        if new_user_yaml:
+            bat_lines.extend([
+                "",
+                "rem === 可选更新: config_user.yaml ===",
+                f'if exist "{new_user_yaml}" (',
+                f'    copy /Y "{new_user_yaml}" "{target_user_yaml}" >> "{log_path}" 2>&1',
+                f'    del "{new_user_yaml}" 2>nul',
+                "    echo [OK] 已更新 config_user.yaml >> \"%s\"" % log_path.replace('%', '%%'),
+                ") else (",
+                "    echo [SKIP] 未找到新的 config_user.yaml, 跳过 >> \"%s\"" % log_path.replace('%', '%%'),
+                ")",
+            ])
+
+        # 可选: config_system.yaml
+        if new_system_yaml:
+            bat_lines.extend([
+                "",
+                "rem === 可选更新: config_system.yaml ===",
+                f'if exist "{new_system_yaml}" (',
+                f'    copy /Y "{new_system_yaml}" "{target_system_yaml}" >> "{log_path}" 2>&1',
+                f'    del "{new_system_yaml}" 2>nul',
+                "    echo [OK] 已更新 config_system.yaml >> \"%s\"" % log_path.replace('%', '%%'),
+                ") else (",
+                "    echo [SKIP] 未找到新的 config_system.yaml, 跳过 >> \"%s\"" % log_path.replace('%', '%%'),
+                ")",
+            ])
 
         bat_lines.extend([
+            "",
             f'echo 更新完成 >> "{log_path}"',
             # 用 explorer 启动 (等同双击文件, 最可靠)
-            f'explorer "{target_path}"',
+            f'explorer "{target_exe}"',
             f'timeout /t 1 >nul',
             f'del "{bat_path}"',
         ])

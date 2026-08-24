@@ -82,22 +82,30 @@ _DEFAULT_CAR_KEYWORDS: Dict[str, str] = {
 
 
 def _load_car_keywords() -> Dict[str, str]:
-    """从 config.yaml 加载 car_keywords, 加载失败则用默认值"""
+    """从 config_user.yaml 加载 car_keywords, 加载失败则用默认值"""
+    try:
+        from .config import load_car_keywords as _cfg_load_car_kw
+        kw = _cfg_load_car_kw()
+        if kw:
+            return kw
+    except Exception:
+        pass
+    # fallback: 走旧逻辑直接读 config.yaml
     import sys, os
     try:
-        # 适配 exe 环境: 找 config.yaml
         if getattr(sys, 'frozen', False):
             root = os.path.dirname(sys.executable)
         else:
             root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cfg_path = os.path.join(root, "config.yaml")
-        if os.path.isfile(cfg_path):
-            import yaml
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-            kw = data.get("car_keywords")
-            if isinstance(kw, dict) and kw:
-                return {str(k): str(v) for k, v in kw.items()}
+        for cfg_name in ("config_user.yaml", "config.yaml"):
+            cfg_path = os.path.join(root, cfg_name)
+            if os.path.isfile(cfg_path):
+                import yaml
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+                kw = data.get("car_keywords")
+                if isinstance(kw, dict) and kw:
+                    return {str(k): str(v) for k, v in kw.items()}
     except Exception:
         pass
     return _DEFAULT_CAR_KEYWORDS

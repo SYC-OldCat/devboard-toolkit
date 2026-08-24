@@ -31,6 +31,8 @@ _DIST_DIR = os.path.join(_PROJECT_ROOT, "dist")
 _EXE_NAME = "devboard_toolkit.exe"
 _RUNNER_NAME = "per_board_runner.exe"
 _VERSION_FILE = "_version.txt"
+_USER_YAML = "config_user.yaml"
+_SYSTEM_YAML = "config_system.yaml"
 
 
 def _run(cmd, cwd=None, check=True):
@@ -114,6 +116,22 @@ def _write_version_file(git_hash):
     print(f"  [+] 已写入: {ver_path}")
 
 
+def _copy_yamls_to_dist():
+    """把项目根目录的 config_user.yaml / config_system.yaml 复制到 dist/
+    不存在则尝试从旧 config.yaml 拆分 (仅复制已存在的, 不创建新的)
+    """
+    import shutil
+    os.makedirs(_DIST_DIR, exist_ok=True)
+    for yname in (_USER_YAML, _SYSTEM_YAML):
+        src = os.path.join(_PROJECT_ROOT, yname)
+        dst = os.path.join(_DIST_DIR, yname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+            print(f"  [+] 复制到 dist/: {yname}")
+        else:
+            print(f"  [!] 项目根目录无 {yname}, 跳过复制")
+
+
 def _create_release(git_hash, notes="", draft=False):
     """用 gh CLI 创建 GitHub Release 并上传 assets"""
     tag = f"v{time.strftime('%Y%m%d_%H%M')}_{git_hash[:8]}"
@@ -143,20 +161,31 @@ def _create_release(git_hash, notes="", draft=False):
     exe_path = os.path.join(_DIST_DIR, _EXE_NAME)
     runner_path = os.path.join(_DIST_DIR, _RUNNER_NAME)
     ver_path = os.path.join(_DIST_DIR, _VERSION_FILE)
+    user_yaml_path = os.path.join(_DIST_DIR, _USER_YAML)
+    system_yaml_path = os.path.join(_DIST_DIR, _SYSTEM_YAML)
 
-    # 检查文件存在
+    # 检查文件存在: 两个 exe + _version.txt 必更 (缺失则终止)
     assets = []
-    if os.path.isfile(exe_path):
-        assets.append(exe_path)
-        print(f"  [+] 上传: {_EXE_NAME} ({os.path.getsize(exe_path) // 1024 // 1024} MB)")
-    else:
-        print(f"  [!] 未找到 {_EXE_NAME}, 跳过")
-    if os.path.isfile(runner_path):
-        assets.append(runner_path)
-        print(f"  [+] 上传: {_RUNNER_NAME} ({os.path.getsize(runner_path) // 1024 // 1024} MB)")
-    if os.path.isfile(ver_path):
-        assets.append(ver_path)
-        print(f"  [+] 上传: {_VERSION_FILE}")
+    missing_required = []
+    for label, fpath in [(_EXE_NAME, exe_path), (_RUNNER_NAME, runner_path), (_VERSION_FILE, ver_path)]:
+        if os.path.isfile(fpath):
+            size_mb = os.path.getsize(fpath) // 1024 // 1024 if label.endswith(".exe") else 0
+            size_str = f" ({size_mb} MB)" if size_mb else ""
+            assets.append(fpath)
+            print(f"  [+] 上传: {label}{size_str}")
+        else:
+            missing_required.append(label)
+    if missing_required:
+        print(f"  [!] 缺失必更新文件: {', '.join(missing_required)}, 终止发布")
+        return False
+
+    # YAML 可选: 有就上传 (用户端 GUI 复选框控制是否替换)
+    for label, fpath in [(_USER_YAML, user_yaml_path), (_SYSTEM_YAML, system_yaml_path)]:
+        if os.path.isfile(fpath):
+            assets.append(fpath)
+            print(f"  [+] 上传: {label}")
+        else:
+            print(f"  [-] dist/ 无 {label}, 跳过 (不影响发布)")
 
     cmd = [
         "gh", "release", "create", tag,
@@ -220,6 +249,7 @@ def main():
             _build_exe()
         git_hash = _get_git_hash()
         _write_version_file(git_hash)
+        _copy_yamls_to_dist()
         print(f"\n  exe 在: {_DIST_DIR}")
         print(f"  版本号: {git_hash}")
         return 0
@@ -259,8 +289,9 @@ def main():
     else:
         print("\n[3] 跳过打包 (--skip-build)")
 
-    # 5. 注入版本号 (dist/)
+    # 5. 注入版本号 (dist/) + 复制 yaml
     _write_version_file(git_hash)
+    _copy_yamls_to_dist()
 
     # 6. 发布
     ok = _create_release(git_hash, notes=notes, draft=args.draft)
