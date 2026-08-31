@@ -145,9 +145,11 @@ def _run_in_thread(target, log_panel, stop_event, on_done=None, prefix=""):
         finally:
             writer.flush()
             tls_stdout.clear_writer()
-            log_queue.put(None)  # 结束标记
             if on_done:
-                log_panel.after(0, lambda: on_done(rc, app_name))
+                # 先塞占位标记, _poll 消费到它时才触发 on_done
+                # 这样 on_done 里的 log_panel.log 会在所有 print 输出之后执行
+                log_queue.put(("__ON_DONE__", rc, app_name))
+            log_queue.put(None)  # 结束标记
 
     # 启动日志轮询 (每 100ms 消费队列)
     def _poll():
@@ -159,6 +161,12 @@ def _run_in_thread(target, log_panel, stop_event, on_done=None, prefix=""):
                     break
                 if msg is None:  # 结束标记
                     return
+                # on_done 标记: 延迟执行 on_done, 保证它之前的 print 都已消费
+                if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == "__ON_DONE__":
+                    _, rc, app_name = msg
+                    if on_done:
+                        on_done(rc, app_name)
+                    continue
                 level = "err" if msg.startswith("[ERROR]") or msg.startswith("[!") else "info"
                 log_panel.log(msg, level)
         finally:
@@ -3264,11 +3272,12 @@ class _BoardEditor(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
-# config.yaml 读写与转换
+# config_user.yaml / config_system.yaml 读写与转换
 # ---------------------------------------------------------------------------
 
-# 项目根目录的 config.yaml 路径
-_CONFIG_YAML_PATH = os.path.join(_PROJECT_ROOT, "config.yaml")
+# config_user.yaml / config_system.yaml 路径 (拆分后用户配置保存到这里)
+_CONFIG_USER_YAML_PATH = os.path.join(_PROJECT_ROOT, "config_user.yaml")
+_CONFIG_SYSTEM_YAML_PATH = os.path.join(_PROJECT_ROOT, "config_system.yaml")
 
 # 开发板共享密码(硬编码)
 _BOARD_PASSWORD = "arcsoft123"
@@ -3290,7 +3299,7 @@ def _save_yaml(path: str, data: dict):
 
 
 def _yaml_to_gui_init(yaml_data: dict) -> dict:
-    """从 config.yaml 的 dict 提取 GUI 初始化参数
+    """从 config_user.yaml 的 dict 提取 GUI 初始化参数
 
     Returns:
         {
@@ -3367,12 +3376,15 @@ def _yaml_to_gui_init(yaml_data: dict) -> dict:
 
 
 def _gui_data_to_yaml(gui_data: dict, existing_yaml: dict) -> dict:
-    """将 GUI 数据合并到现有 yaml dict 中(保留不在 GUI 管理的段)
+    """将 GUI 数据合并到现有 yaml dict 中(只更新用户配置段, 不动系统段)
+
+    用户段: boards / mount / replay_env / car_models / jira_data / jenkins / adas / paths
+    系统段 (不受此函数影响): usage_check / data_proc_car_keywords / replay_list_template / replay_sdk_template
 
     Returns:
-        更新后的完整 yaml dict
+        更新后的 yaml dict (仅用户段被刷新, 其余段原样保留)
     """
-    yaml_out = dict(existing_yaml)  # 浅拷贝,保留 replay_list_template 等段
+    yaml_out = dict(existing_yaml)  # 浅拷贝,保留所有不在 GUI 管理的段
 
     # Boards
     boards_out = {}
@@ -3464,18 +3476,27 @@ class SettingsDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self._on_save_cb = on_save
-        self._config_path = config_path or _CONFIG_YAML_PATH
+        self._config_path = config_path or _CONFIG_USER_YAML_PATH
 
-        # 读取现有 config.yaml 作为初始化数据
+        # 读取现有 config_user.yaml 作为初始化数据
         yaml_data = _load_yaml(self._config_path)
         self._yaml_data = yaml_data
         init_data = _yaml_to_gui_init(yaml_data)
 
+        # 读取 config_system.yaml (系统配置, 独立保存)
+        self._system_yaml_path = _CONFIG_SYSTEM_YAML_PATH
+        self._system_yaml_data = _load_yaml(self._system_yaml_path)
+        sys_data = self._system_yaml_data
+        _usage = sys_data.get("usage_check", {})
+        _dpc = sys_data.get("data_proc_car_keywords", {})
+
         # 底部按钮 (必须先于 notebook pack, 否则 expand=True 的 notebook 会把它挤出窗口)
         footer = ttk.Frame(self)
         footer.pack(side="bottom", fill="x", padx=10, pady=(0, 12))
-        ttk.Button(footer, text="💾 保存到 config.yaml", style="Primary.TButton",
+        ttk.Button(footer, text="💾 保存到 config_user.yaml", style="Primary.TButton",
                    command=self._on_save).pack(side="right")
+        ttk.Button(footer, text="💾 保存系统配置", style="Ghost.TButton",
+                   command=self._on_save_system).pack(side="right", padx=8)
         ttk.Button(footer, text="📥 导入配置", style="Ghost.TButton",
                    command=self._on_import).pack(side="right", padx=8)
         ttk.Button(footer, text="📤 导出配置", style="Ghost.TButton",
@@ -3557,6 +3578,37 @@ class SettingsDialog(tk.Toplevel):
                                  default=_paths["output_root"])
         self.out_root.pack(fill="x", pady=4)
 
+        # --- 系统配置: 检测阈值 (config_system.yaml) ---
+        sys_usage_f = ttk.Frame(nb, padding=10)
+        nb.add(sys_usage_f, text=" ⚙ 检测阈值 ")
+        self.sys_loadavg = self._row(sys_usage_f, "loadavg 阈值:", str(_usage.get("loadavg_threshold", 4.0)))
+        self.sys_netrx = self._row(sys_usage_f, "网卡流量阈值(GB):", str(_usage.get("net_rx_threshold_gb", 1.0)))
+        ttk.Label(sys_usage_f, text="说明: 判定开发板空闲的阈值。loadavg 低于阈值且网卡流量低于阈值 → 空闲。",
+                  style="Hint.TLabel", wraplength=560, justify="left").pack(fill="x", pady=(8, 0))
+
+        # --- 系统配置: 车型映射 (config_system.yaml) ---
+        sys_car_f = ttk.Frame(nb, padding=10)
+        nb.add(sys_car_f, text=" ⚙ 车型映射 ")
+        ttk.Label(sys_car_f, text="Jira 标题关键词匹配:", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 4))
+        _title_kw = _dpc.get("title_keywords", {})
+        self.sys_title_editor = _DynKVEditor(
+            sys_car_f, key_label="标题关键词", value_label="车型编号",
+            initial=[(k, v) for k, v in _title_kw.items()],
+        )
+        self.sys_title_editor.pack(fill="both", expand=False, pady=(0, 8))
+
+        ttk.Label(sys_car_f, text="视频路径关键词匹配:", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 4))
+        _path_kw = _dpc.get("path_keywords", {})
+        self.sys_path_editor = _DynKVEditor(
+            sys_car_f, key_label="路径关键词", value_label="车型编号",
+            initial=[(k, v) for k, v in _path_kw.items()],
+        )
+        self.sys_path_editor.pack(fill="both", expand=False, pady=(0, 8))
+
+        self.sys_default_car = self._row(sys_car_f, "兜底车型:", str(_dpc.get("default", "0452")))
+        ttk.Label(sys_car_f, text="说明: 数据处理时按 Jira 标题/视频路径匹配车型, 均不命中时用兜底车型。",
+                  style="Hint.TLabel", wraplength=560, justify="left").pack(fill="x", pady=(8, 0))
+
     def _row(self, parent, label: str, default: str = "", show: str = "") -> tk.StringVar:
         r = ttk.Frame(parent)
         r.pack(fill="x", pady=4)
@@ -3611,6 +3663,41 @@ class SettingsDialog(tk.Toplevel):
                 pass
         messagebox.showinfo("设置", f"已保存到 {self._config_path}")
         self.destroy()
+
+    def _on_save_system(self):
+        """收集系统配置数据并保存到 config_system.yaml (保留模板段不动)"""
+        try:
+            # 解析数值
+            try:
+                loadavg = float(self.sys_loadavg.get().strip())
+            except ValueError:
+                loadavg = 4.0
+            try:
+                netrx = float(self.sys_netrx.get().strip())
+            except ValueError:
+                netrx = 1.0
+
+            title_kw = dict(self.sys_title_editor.get_items())
+            path_kw = dict(self.sys_path_editor.get_items())
+            default_car = self.sys_default_car.get().strip() or "0452"
+
+            # 合并到现有 config_system.yaml (保留 replay_list_template / replay_sdk_template)
+            sys_out = dict(self._system_yaml_data)
+            sys_out["usage_check"] = {
+                "loadavg_threshold": loadavg,
+                "net_rx_threshold_gb": netrx,
+            }
+            sys_out["data_proc_car_keywords"] = {
+                "title_keywords": title_kw,
+                "path_keywords": path_kw,
+                "default": default_car,
+            }
+            _save_yaml(self._system_yaml_path, sys_out)
+            self._system_yaml_data = sys_out
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+            return
+        messagebox.showinfo("系统配置", f"已保存到 {self._system_yaml_path}")
 
     def _on_import(self):
         p = filedialog.askopenfilename(filetypes=[("YAML 文件", "*.yaml *.yml")])
@@ -4166,10 +4253,10 @@ class App(tk.Tk):
         self.after(800, self.quit)
 
     def _open_settings(self):
-        SettingsDialog(self, on_save=self._save_settings, config_path=_CONFIG_YAML_PATH)
+        SettingsDialog(self, on_save=self._save_settings, config_path=_CONFIG_USER_YAML_PATH)
 
     def _save_settings(self, data: dict):
-        """演示占位: 真正实现时这里写 config.yaml"""
+        """设置已保存到 config_user.yaml"""
         self._status_var.set(
             f"设置已保存: Jira={data['jira']['username']}, "
             f"Jenkins={data['jenkins']['url']}")

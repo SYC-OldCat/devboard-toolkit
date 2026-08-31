@@ -7,6 +7,7 @@
     python release.py --skip-git       # 跳过 git 提交推送 (已手动提交时)
     python release.py --notes "修复..." # 指定 Release notes
     python release.py --notes-file notes.txt  # 从 UTF-8 文件读取 Release notes (支持多行)
+    python release.py --include-user-yaml --include-system-yaml
 
 前置条件:
     1. gh CLI 已安装并登录 (gh auth login)

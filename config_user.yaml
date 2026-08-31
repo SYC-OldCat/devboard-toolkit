@@ -121,6 +121,7 @@ car_models:
   '0463_1': '0463'
   0452new: 0452new
   '1604': '1604'
+  aeb2m_lixiang2: aeb2m_lixiang2
 
 # 车型关键词映射 (classify_by_car.py 使用)
 # key 出现在素材路径中即归为 value 对应的车型
@@ -175,13 +176,13 @@ car_keywords:
   '2239': geely_2239
   '2506': geely_2506
   '0452': geely_0452
-  '463': geely_463
   '0463': geely_0463
-  '508': geely_0508
   '1604': geely_1604
   '0508': geely_0508
   '5463': geely_5463
   '3637': geely_3637
+  '5013': '5013'
+
 
 jenkins:
   server: http://172.17.189.18:8080
